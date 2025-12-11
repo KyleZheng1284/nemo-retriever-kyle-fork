@@ -255,33 +255,36 @@ Please keep in mind that this response is purely humorous and interpretative, as
 ```
 
 
+
 ## Logging Configuration
 
-By default, library mode runs in **quiet mode** to minimize startup noise. This automatically configures the following environment variables:
+Nemo Retriever extraction uses [Ray](https://docs.ray.io/en/latest/index.html) for logging. 
+For details, refer to [Configure Ray Logging](ray-logging.md).
 
-| Variable | Value | Purpose |
-|----------|-------|---------|
-| `INGEST_RAY_LOG_LEVEL` | `PRODUCTION` | Sets Ray logging to ERROR level |
-| `RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO` | `0` | Silences Ray accelerator warnings |
-| `OTEL_SDK_DISABLED` | `true` | Disables OpenTelemetry trace export errors |
+By default, library mode runs in quiet mode to minimize startup noise. 
+Quiet mode automatically configures the following environment variables.
 
-### Enable Verbose Logging
+| Variable                             | Quiet Mode Value | Description |
+|--------------------------------------|------------------|-------------|
+| `INGEST_RAY_LOG_LEVEL`               | `PRODUCTION`     | Sets Ray logging to ERROR level to reduce noise. |
+| `RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO` | `0`              | Silences Ray accelerator warnings |
+| `OTEL_SDK_DISABLED`                  | `true`           | Disables OpenTelemetry trace export errors |
 
-To see detailed startup logs for debugging, you have two options:
 
-**Option 1: Use the `quiet` parameter**
+If you want to see detailed startup logs for debugging, use one of the following options:
 
-```python
-run_pipeline(block=False, disable_dynamic_scaling=True, run_in_subprocess=True, quiet=False)
-```
+- Set `quiet=False` when you run the pipeline as shown following.
 
-**Option 2: Set environment variables before running**
+    ```python
+    run_pipeline(block=False, disable_dynamic_scaling=True, run_in_subprocess=True, quiet=False)
+    ```
 
-```bash
-export INGEST_RAY_LOG_LEVEL=DEVELOPMENT  # or DEBUG for maximum verbosity
-```
+- Set the environment variables manually before you run the pipeline as shown following.
 
-For more information on logging configuration, refer to [Ray Logging Configuration](ray-logging.md).
+    ```bash
+    export INGEST_RAY_LOG_LEVEL=DEVELOPMENT  # or DEBUG for maximum verbosity
+    ```
+
 
 
 ## Library Mode Communication and Advanced Examples
