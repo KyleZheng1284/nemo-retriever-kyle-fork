@@ -462,7 +462,14 @@ class _DuckDBVDB(VDB):
                 SET description = ?, metadata_json = ?, expires_at = ?, updated_at = ?
                 WHERE scope = ? AND name = ?
                 """,
-                [description, metadata_json, expires_at, _now(), scope, collection_name],
+                [
+                    description,
+                    metadata_json,
+                    expires_at,
+                    _now(),
+                    scope,
+                    collection_name,
+                ],
             )
             return self.get_collection(scope=scope, collection_name=collection_name)
 
@@ -858,7 +865,9 @@ def _write_collection(
     )
 
 
-def test_duckdb_vdb_runs_legacy_ingest_and_query_through_http(duckdb_vdb: _DuckDBVDB) -> None:
+def test_duckdb_vdb_runs_legacy_ingest_and_query_through_http(
+    duckdb_vdb: _DuckDBVDB,
+) -> None:
     """The required VDB methods work through both service-owned operators."""
     records = [
         _record("closest legacy row", [1.0, 0.0], source_id="closest.pdf"),
@@ -881,7 +890,9 @@ def test_duckdb_vdb_runs_legacy_ingest_and_query_through_http(duckdb_vdb: _DuckD
     assert not {"embedding", "vector", "physical_table", "table_name"}.intersection(hits[0])
 
 
-def test_duckdb_vdb_runs_collection_lifecycle_through_http(duckdb_vdb: _DuckDBVDB) -> None:
+def test_duckdb_vdb_runs_collection_lifecycle_through_http(
+    duckdb_vdb: _DuckDBVDB,
+) -> None:
     """Collection identity, persistence, ranking, replacement, and deletion stay backend-neutral."""
     tenant_a = {"X-NRL-Scope": "tenant-a"}
     tenant_b = {"X-NRL-Scope": "tenant-b"}
@@ -998,7 +1009,14 @@ def test_duckdb_vdb_runs_collection_lifecycle_through_http(duckdb_vdb: _DuckDBVD
                 document_id="doc-a",
                 version="v2",
                 content_sha256="sha-a-v2",
-                records=[_record("tenant A revised", [1.0, 0.0], source_id="a-v2.pdf", page_number=2)],
+                records=[
+                    _record(
+                        "tenant A revised",
+                        [1.0, 0.0],
+                        source_id="a-v2.pdf",
+                        page_number=2,
+                    )
+                ],
                 operation="replace",
             )
             replaced_document = client.get(
@@ -1019,6 +1037,39 @@ def test_duckdb_vdb_runs_collection_lifecycle_through_http(duckdb_vdb: _DuckDBVD
                 "/v1/query",
                 headers=tenant_a,
                 json={"query": "remaining", "collection_name": "research", "top_k": 10},
+            )
+            missing_deleted_document = client.get(
+                "/v1/collections/research/documents/doc-a",
+                headers=tenant_a,
+            )
+            reuploaded = _write_collection(
+                client,
+                scope="tenant-a",
+                collection_name="research",
+                document_id="doc-a",
+                version="v3",
+                content_sha256="sha-a-v3",
+                records=[
+                    _record(
+                        "tenant A reuploaded",
+                        [1.0, 0.0],
+                        source_id="a-v3.pdf",
+                        page_number=3,
+                    )
+                ],
+            )
+            reuploaded_document = client.get(
+                "/v1/collections/research/documents/doc-a",
+                headers=tenant_a,
+            )
+            after_reupload = client.post(
+                "/v1/query",
+                headers=tenant_a,
+                json={
+                    "query": "reuploaded",
+                    "collection_name": "research",
+                    "top_k": 10,
+                },
             )
             deleted_collection = client.delete("/v1/collections/research", headers=tenant_a)
             missing_collection = client.get("/v1/collections/research", headers=tenant_a)
@@ -1052,12 +1103,23 @@ def test_duckdb_vdb_runs_collection_lifecycle_through_http(duckdb_vdb: _DuckDBVD
     assert replaced_document.json()["document_version"] == "v2"
     assert replaced_document.json()["content_sha256"] == "sha-a-v2"
     revised_hits = replaced_query.json()["results"][0]["hits"]
-    assert [hit["text"] for hit in revised_hits] == ["tenant A revised", "tenant A second"]
+    assert [hit["text"] for hit in revised_hits] == [
+        "tenant A revised",
+        "tenant A second",
+    ]
     assert revised_hits[0]["page_number"] == 2
     assert all(hit["text"] != "tenant A first" for hit in revised_hits)
 
     assert deleted_document.status_code == 200
     assert [hit["document_id"] for hit in after_document_delete.json()["results"][0]["hits"]] == ["doc-b"]
+    assert missing_deleted_document.status_code == 404
+    assert reuploaded.json() == {"written": 1, "total_rows": 2}
+    assert reuploaded_document.json()["document_version"] == "v3"
+    assert reuploaded_document.json()["chunk_count"] == 1
+    assert [hit["text"] for hit in after_reupload.json()["results"][0]["hits"]] == [
+        "tenant A reuploaded",
+        "tenant A second",
+    ]
     assert deleted_collection.status_code == 200
     assert missing_collection.status_code == 404
     assert other_scope_survives.status_code == 200
