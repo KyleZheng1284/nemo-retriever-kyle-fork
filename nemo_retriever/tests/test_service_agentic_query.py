@@ -13,7 +13,7 @@ from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
 import nemo_retriever.service.vectordb_app as vectordb_module
-from nemo_retriever.common.vdb.adt_vdb import VDBResourceNotFound
+from nemo_retriever.common.vdb.adt_vdb import VDBInvalidRequest, VDBResourceNotFound
 from nemo_retriever.service.app import create_app
 from nemo_retriever.service.agentic_query import (
     agentic_ranked_to_hits,
@@ -35,6 +35,19 @@ from nemo_retriever.service.query_schema import (
     QueryResult,
 )
 from nemo_retriever.service.vectordb_app import VectorDBState, create_vectordb_app
+
+
+def _create_enabled_agentic_app(tmp_path, **kwargs):
+    return create_vectordb_app(
+        lancedb_uri=str(tmp_path),
+        embed_endpoint="https://embed.example/v1/embeddings",
+        agentic_config=AgenticConfig(
+            enabled=True,
+            llm_model="model",
+            invoke_url="https://llm.example/v1/chat/completions",
+        ),
+        **kwargs,
+    )
 
 
 def test_agentic_service_config_requires_remote_model_and_endpoint() -> None:
@@ -245,16 +258,10 @@ def test_agentic_query_binds_each_scope_to_its_logical_collection(tmp_path) -> N
         )
 
     backend.retrieve_collection.side_effect = retrieve_collection
-    app = create_vectordb_app(
-        lancedb_uri=str(tmp_path),
-        embed_endpoint="https://embed.example/v1/embeddings",
+    app = _create_enabled_agentic_app(
+        tmp_path,
         vdb=backend,
         reconciliation_interval_seconds=0,
-        agentic_config=AgenticConfig(
-            enabled=True,
-            llm_model="model",
-            invoke_url="https://llm.example/v1/chat/completions",
-        ),
     )
 
     def fake_agentic_query(**kwargs):
@@ -326,16 +333,10 @@ def test_agentic_query_binds_each_scope_to_its_logical_collection(tmp_path) -> N
 def test_agentic_collection_query_preflights_before_starting_agent(tmp_path) -> None:
     backend = MagicMock()
     backend.get_collection.side_effect = VDBResourceNotFound("Collection not found")
-    app = create_vectordb_app(
-        lancedb_uri=str(tmp_path),
-        embed_endpoint="https://embed.example/v1/embeddings",
+    app = _create_enabled_agentic_app(
+        tmp_path,
         vdb=backend,
         reconciliation_interval_seconds=0,
-        agentic_config=AgenticConfig(
-            enabled=True,
-            llm_model="model",
-            invoke_url="https://llm.example/v1/chat/completions",
-        ),
     )
 
     with (
@@ -354,6 +355,60 @@ def test_agentic_collection_query_preflights_before_starting_agent(tmp_path) -> 
     backend.health.assert_not_called()
     embed_queries.assert_not_called()
     run_query.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("retrieval_error", "expected_status"),
+    [
+        pytest.param(VDBInvalidRequest("Collection is deleting"), 422, id="deleting"),
+        pytest.param(VDBInvalidRequest("Collection is expired"), 422, id="expired"),
+        pytest.param(VDBResourceNotFound("Collection not found"), 404, id="deleted-after-preflight"),
+    ],
+)
+def test_agentic_collection_query_restores_lifecycle_error_after_agent_failure(
+    tmp_path,
+    retrieval_error: Exception,
+    expected_status: int,
+) -> None:
+    backend = MagicMock()
+    backend.retrieve_collection.side_effect = retrieval_error
+    app = _create_enabled_agentic_app(
+        tmp_path,
+        vdb=backend,
+        reconciliation_interval_seconds=0,
+    )
+
+    def fail_after_retrieval(**kwargs):
+        try:
+            kwargs["retrieve_hits_fn"]("rewritten query", 7)
+        except (VDBInvalidRequest, VDBResourceNotFound):
+            raise RuntimeError("Agentic retrieval tool failed") from None
+        raise AssertionError("Expected collection retrieval to fail")
+
+    with (
+        patch.object(VectorDBState, "embed_queries", return_value=[[1.0, 0.0]]) as embed_queries,
+        patch.object(vectordb_module, "run_agentic_query", side_effect=fail_after_retrieval) as run_query,
+        TestClient(app) as client,
+    ):
+        response = client.post(
+            "/v1/query",
+            headers={"X-NRL-Scope": "tenant-a"},
+            json={"query": "q", "agentic": True, "collection_name": "workspace"},
+        )
+
+    assert response.status_code == expected_status
+    assert response.json() == {"detail": str(retrieval_error)}
+    backend.get_collection.assert_called_once_with(scope="tenant-a", collection_name="workspace")
+    backend.retrieve_collection.assert_called_once_with(
+        [[1.0, 0.0]],
+        scope="tenant-a",
+        collection_name="workspace",
+        query_texts=["rewritten query"],
+        top_k=7,
+    )
+    backend.health.assert_not_called()
+    embed_queries.assert_called_once_with(["rewritten query"])
+    run_query.assert_called_once()
 
 
 def test_agentic_true_runs_react_workflow_on_v1_query(tmp_path) -> None:
@@ -451,15 +506,7 @@ def test_agentic_query_rejects_top_k_above_backend_depth(tmp_path) -> None:
 
 
 def test_agentic_query_rejects_query_above_length_limit(tmp_path) -> None:
-    app = create_vectordb_app(
-        lancedb_uri=str(tmp_path),
-        embed_endpoint="https://embed.example/v1/embeddings",
-        agentic_config=AgenticConfig(
-            enabled=True,
-            llm_model="model",
-            invoke_url="https://llm.example/v1/chat/completions",
-        ),
-    )
+    app = _create_enabled_agentic_app(tmp_path)
 
     with (
         patch.object(VectorDBState, "table_exists", new_callable=PropertyMock, return_value=True),
@@ -479,15 +526,7 @@ def test_agentic_query_slots_are_bounded_and_released_by_the_worker(tmp_path) ->
     """Capacity follows the worker thread, not the caller: a saturated pool sheds
     load with 503 instead of queueing behind non-cancellable ReAct work, and a
     completed query returns its slot."""
-    app = create_vectordb_app(
-        lancedb_uri=str(tmp_path),
-        embed_endpoint="https://embed.example/v1/embeddings",
-        agentic_config=AgenticConfig(
-            enabled=True,
-            llm_model="model",
-            invoke_url="https://llm.example/v1/chat/completions",
-        ),
-    )
+    app = _create_enabled_agentic_app(tmp_path)
     expected = QueryResponse(results=[QueryResult(hits=[])], query_mode="agentic")
 
     with (
@@ -532,12 +571,18 @@ def test_gateway_proxies_agentic_flag_to_vectordb(
     )
     config = ServiceConfig(
         mode="standalone",
-        auth=AuthConfig(allow_unscoped_dev=True),
+        auth=AuthConfig(
+            enabled=True,
+            api_token="public-secret",
+            default_scope="tenant-a",
+            allow_unscoped_dev=False,
+        ),
         logging=LoggingConfig(file=str(tmp_path / "service.log")),
         pipeline=PipelinePoolConfig(realtime_workers=1, batch_workers=1),
         vectordb=VectorDbConfig(
             enabled=True,
             vectordb_url="http://vectordb:7671",
+            internal_api_token="internal-secret",
         ),
         agentic=AgenticConfig(
             enabled=True,
@@ -565,6 +610,7 @@ def test_gateway_proxies_agentic_flag_to_vectordb(
         async def post(self, url: str, **kwargs) -> _FakeResponse:
             seen["url"] = url
             seen["body"] = json.loads(kwargs["content"])
+            seen["headers"] = kwargs["headers"]
             return _FakeResponse()
 
     monkeypatch.setattr("httpx.AsyncClient", _FakeAsyncClient)
@@ -572,16 +618,21 @@ def test_gateway_proxies_agentic_flag_to_vectordb(
     with TestClient(create_app(config)) as client:
         response = client.post(
             "/v1/query",
+            headers={"Authorization": "Bearer public-secret"},
             json={"query": "revenue trend", "top_k": 3, "agentic": True},
         )
 
     assert response.status_code == 200
     assert response.json() == {"results": [{"hits": []}]}
-    assert seen == {
-        "timeout": 321.0,
-        "url": "http://vectordb:7671/v1/query",
-        "body": {"query": "revenue trend", "top_k": 3, "agentic": True},
-    }
+    assert seen["timeout"] == 321.0
+    assert seen["url"] == "http://vectordb:7671/v1/query"
+    assert seen["body"] == {"query": "revenue trend", "top_k": 3, "agentic": True}
+    forwarded_headers = seen["headers"]
+    assert isinstance(forwarded_headers, dict)
+    assert forwarded_headers["Content-Type"] == "application/json"
+    assert forwarded_headers["X-NRL-Scope"] == "tenant-a"
+    assert forwarded_headers["X-NRL-Internal-Token"] == "internal-secret"
+    assert "Authorization" not in forwarded_headers
 
 
 def test_service_rejects_agentic_flag_when_not_configured(

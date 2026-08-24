@@ -218,12 +218,11 @@ def build_agentic_retriever(
     """Construct an :class:`AgenticRetriever` from a :class:`QueryRequest`."""
     from nemo_retriever.query.agentic import AgenticRetriever
 
-    retriever_kwargs: dict[str, Any] = {}
-    if retrieve_hits_fn is not None:
-        retriever_kwargs["retrieve_hits_fn"] = retrieve_hits_fn
-    if doc_id_field is not None:
-        retriever_kwargs["doc_id_field"] = doc_id_field
-    return AgenticRetriever(build_agentic_config(request), **retriever_kwargs)
+    return AgenticRetriever(
+        build_agentic_config(request),
+        retrieve_hits_fn=retrieve_hits_fn,
+        doc_id_field=doc_id_field,
+    )
 
 
 def agentic_query_documents(

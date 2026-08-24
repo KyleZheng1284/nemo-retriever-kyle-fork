@@ -36,7 +36,5 @@ services:
       - ${AGENTIC_TEMPERATURE:-0}
       - --agentic-max-tokens
       - ${AGENTIC_MAX_TOKENS:-1024}
-      - --agentic-request-timeout
-      - ${AGENTIC_REQUEST_TIMEOUT_S:-1800}
       - --port
       - "7671"

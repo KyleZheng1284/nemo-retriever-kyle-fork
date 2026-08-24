@@ -230,7 +230,11 @@ The public token is not forwarded to VectorDB. The gateway uses
 `NRL_INTERNAL_VDB_TOKEN` for that private hop. Each retrieval step remains
 bound to the authorized scope and logical collection.
 
-On Kubernetes, the Helm chart maps the same knobs under `serviceConfig.agentic`. Enabling `nimOperator.answer_llm` does not populate this block. Refer to [Self-hosted Helm Super-49B](#self-hosted-helm-super-49b) and the [Helm chart README](https://github.com/NVIDIA/NeMo-Retriever/blob/main/nemo_retriever/helm/README.md#agentic-retrieval-llm).
+On Kubernetes, configure the agentic fields exposed under
+`serviceConfig.agentic`. The Helm chart does not currently expose
+`agentic.max_tokens`; enabling `nimOperator.answer_llm` also does not populate
+this block. Refer to [Self-hosted Helm Super-49B](#self-hosted-helm-super-49b)
+and the [Helm chart README](https://github.com/NVIDIA/NeMo-Retriever/blob/main/nemo_retriever/helm/README.md#agentic-retrieval-llm).
 
 The VectorDB service runs up to four non-agentic queries concurrently by default.
 Set `--max-concurrent-queries` when starting `nemo_retriever.service.vectordb_app`

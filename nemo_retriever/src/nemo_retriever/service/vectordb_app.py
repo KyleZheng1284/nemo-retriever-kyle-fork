@@ -756,6 +756,8 @@ def create_vectordb_app(
                 f"backend_top_k ({agentic_config.backend_top_k})."
             )
 
+        collection_error: VDBInvalidRequest | VDBResourceNotFound | None = None
+        collection_error_lock = threading.Lock()
         agentic_runner_kwargs: dict[str, Any] = {}
         if req.collection_name is not None:
             collection_name = req.collection_name
@@ -766,14 +768,21 @@ def create_vectordb_app(
             )
 
             def retrieve_collection_hits(query_text: str, top_k: int) -> list[dict[str, Any]]:
+                nonlocal collection_error
                 vectors = current.embed_queries([query_text])
-                result = current.retrieve_operator.run(
-                    vectors,
-                    scope=scope,
-                    collection_name=collection_name,
-                    query_texts=[query_text],
-                    top_k=top_k,
-                )
+                try:
+                    result = current.retrieve_operator.run(
+                        vectors,
+                        scope=scope,
+                        collection_name=collection_name,
+                        query_texts=[query_text],
+                        top_k=top_k,
+                    )
+                except (VDBInvalidRequest, VDBResourceNotFound) as exc:
+                    with collection_error_lock:
+                        if collection_error is None:
+                            collection_error = exc
+                    raise
                 if not isinstance(result, tuple):
                     raise RetrievalContractError("Collection retrieval did not return strategies")
                 hits_per_query, _strategies = result
@@ -827,8 +836,13 @@ def create_vectordb_app(
         future.add_done_callback(lambda _future: slots.release())
         try:
             return await asyncio.wrap_future(future)
-        except ValueError as exc:
-            raise VDBInvalidRequest(str(exc)) from exc
+        except Exception as exc:
+            with collection_error_lock:
+                if collection_error is not None:
+                    raise collection_error
+            if isinstance(exc, ValueError):
+                raise VDBInvalidRequest(str(exc)) from exc
+            raise
 
     return app
 

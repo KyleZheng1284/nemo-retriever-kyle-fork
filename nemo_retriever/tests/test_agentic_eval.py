@@ -301,29 +301,50 @@ def test_rehydration_isolates_same_doc_id_per_query():
     assert "_retrieval_query_id" not in rehydrated.columns
 
 
-def test_agentic_query_documents_returns_classic_hit_fields_with_annotations():
+def test_agentic_query_documents_exercises_callback_contract_through_real_builder():
     from nemo_retriever.query.options import QueryAgenticOptions, QueryRequest, QueryRetrievalOptions
     from nemo_retriever.query.workflow import agentic_query_documents
 
-    retriever = MagicMock()
-    retriever.retrieve.return_value = pd.DataFrame(
-        {
-            "query_id": ["0", "0"],
-            "doc_id": ["doc_1", "invented"],
-            "rank": [1, 2],
-            "message": ["", ""],
-            "result_source": ["selection_agent", "final_results"],
-            "hit": [{"text": "body", "source": "/tmp/doc.pdf", "page_number": 1}, {}],
-        }
-    )
     request = QueryRequest(
         query="find doc",
-        retrieval=QueryRetrievalOptions(top_k=2),
-        agentic=QueryAgenticOptions(enabled=True, llm_model="m", invoke_url=_REMOTE_URL),
+        retrieval=QueryRetrievalOptions(top_k=1),
+        agentic=QueryAgenticOptions(enabled=True, llm_model="nemotron-8b"),
     )
+    retrieve_hits = MagicMock(
+        side_effect=lambda query, _top_k: (
+            [
+                {
+                    "chunk_id": "chunk-1",
+                    "document_id": "document-1",
+                    "text": "body",
+                    "distance": 0.2,
+                    "filename": "report.pdf",
+                }
+            ]
+            if query == "rewritten query"
+            else []
+        )
+    )
+    react_responses = iter(
+        [
+            _make_tool_call_response("retrieve", {"query": "rewritten query", "top_k": 7}),
+            _make_tool_call_response(
+                "final_results",
+                {"doc_ids": ["chunk-1"], "message": "done", "search_successful": "true"},
+            ),
+        ]
+    )
+    chat_fn = MagicMock(side_effect=lambda **_kwargs: next(react_responses))
 
-    retrieve_hits = MagicMock()
-    with patch("nemo_retriever.query.workflow.build_agentic_retriever", return_value=retriever) as build_retriever:
+    class GraphOnlyRetriever(FakeRetriever):
+        def __init__(self, **kwargs):
+            if kwargs.get("graph") is None:
+                raise AssertionError("callback mode must not construct a physical-table Retriever")
+            super().__init__(**kwargs)
+
+    with patch("nemo_retriever.query.agentic.Retriever", GraphOnlyRetriever), patch(
+        "nemo_retriever.query.agentic.AGENTIC_RETRIEVER_TOP_K", 7
+    ), patch("nemo_retriever.query.agentic._build_agent_chat_completion_fn", return_value=chat_fn):
         ranked = agentic_query_documents(
             request,
             retrieve_hits_fn=retrieve_hits,
@@ -332,21 +353,18 @@ def test_agentic_query_documents_returns_classic_hit_fields_with_annotations():
 
     assert ranked == [
         {
+            "chunk_id": "chunk-1",
+            "document_id": "document-1",
             "text": "body",
-            "source": "/tmp/doc.pdf",
-            "page_number": 1,
-            "doc_id": "doc_1",
+            "distance": 0.2,
+            "filename": "report.pdf",
+            "doc_id": "chunk-1",
             "rank": 1,
-            "result_source": "selection_agent",
+            "result_source": "final_results",
         },
-        {"doc_id": "invented", "rank": 2, "result_source": "final_results"},
     ]
-    build_retriever.assert_called_once_with(
-        request,
-        retrieve_hits_fn=retrieve_hits,
-        doc_id_field="chunk_id",
-    )
-    retriever.unload.assert_called_once()
+    retrieve_hits.assert_any_call("rewritten query", 7)
+    chat_fn.unload.assert_called_once()
 
 
 @patch("nemo_retriever.query.agentic.Retriever", FakeRetriever)

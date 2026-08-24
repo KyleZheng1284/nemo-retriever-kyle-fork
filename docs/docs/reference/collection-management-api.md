@@ -167,12 +167,15 @@ names and tenant identifiers are never emitted as public values or labels.
 
 The default development stack lives at
 `nemo_retriever/dev/compose/service-mode.compose.yaml` and runs the Retriever
-and VectorDB as separate services. Set `NRL_API_TOKEN` to opt into a public
-bearer credential and `NRL_INTERNAL_VDB_TOKEN` to protect the private service
-hop; leaving them unset preserves the existing unauthenticated development
-behavior. Runtime tokens must not be committed. Production deployments can
-continue to use the service's Secret-backed multi-scope token-file support.
-The same SDK workflow targets `http://localhost:7670`.
+and VectorDB as separate services. To enable scoped static-token authentication,
+set `NRL_AUTH_ENABLED=true`, `NRL_API_TOKEN`, and
+`NRL_ALLOW_UNSCOPED_DEV=false`; set `NRL_SCOPE` when using a non-default scope.
+Set `NRL_INTERNAL_VDB_TOKEN` to a different secret that protects the private
+service hop. Leaving authentication disabled preserves the existing
+unauthenticated development behavior. Runtime tokens must not be committed.
+Production deployments can continue to use the service's Secret-backed
+multi-scope token-file support. The same SDK workflow targets
+`http://localhost:7670`.
 
 ## Application integration and query-result contract
 

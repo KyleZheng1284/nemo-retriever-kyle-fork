@@ -2,7 +2,7 @@
 # All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Compose contracts for the Object Detection and OCR 2.0 NIMs."""
+"""Compose contracts for hosted endpoints, extraction NIMs, and agentic service mode."""
 
 from __future__ import annotations
 
@@ -159,10 +159,10 @@ def test_agentic_overlay_requires_remote_model_and_wires_vectordb_flags() -> Non
         "--agentic-text-truncation": "${AGENTIC_TEXT_TRUNCATION:-0}",
         "--agentic-temperature": "${AGENTIC_TEMPERATURE:-0}",
         "--agentic-max-tokens": "${AGENTIC_MAX_TOKENS:-1024}",
-        "--agentic-request-timeout": "${AGENTIC_REQUEST_TIMEOUT_S:-1800}",
     }
     for flag, expected_value in expected_values.items():
         assert command[command.index(flag) + 1] == expected_value
+    assert "--agentic-request-timeout" not in command
 
 
 def test_compose_render_keeps_base_classic_and_enables_scoped_agentic_overlay() -> None:
@@ -184,6 +184,7 @@ def test_compose_render_keeps_base_classic_and_enables_scoped_agentic_overlay() 
         "AGENTIC_LLM_MODEL": "agent-model",
         "AGENTIC_INVOKE_URL": "https://agent.example/v1/chat/completions",
         "AGENTIC_MAX_TOKENS": "2048",
+        "AGENTIC_REQUEST_TIMEOUT_S": "1777",
         "NRL_AUTH_ENABLED": "true",
         "NRL_API_TOKEN": "public-validation-token",
         "NRL_INTERNAL_VDB_TOKEN": "internal-validation-token",
@@ -196,6 +197,7 @@ def test_compose_render_keeps_base_classic_and_enables_scoped_agentic_overlay() 
     agentic_gateway = yaml.safe_load(agentic_config["configs"]["retriever_service_config"]["content"])
     assert agentic_gateway["agentic"]["enabled"] is True
     assert agentic_gateway["agentic"]["max_tokens"] == 2048
+    assert agentic_gateway["agentic"]["request_timeout_s"] == 1777
     assert agentic_gateway["auth"] == {
         "enabled": True,
         "api_token": "public-validation-token",
@@ -205,6 +207,7 @@ def test_compose_render_keeps_base_classic_and_enables_scoped_agentic_overlay() 
     assert "--agentic" in agentic_config["services"]["vectordb"]["command"]
     agentic_command = agentic_config["services"]["vectordb"]["command"]
     assert agentic_command[agentic_command.index("--agentic-max-tokens") + 1] == "2048"
+    assert "--agentic-request-timeout" not in agentic_command
     assert agentic_config["services"]["retriever"]["environment"]["NRL_API_TOKEN"] == "public-validation-token"
     assert (
         agentic_config["services"]["retriever"]["environment"]["NRL_INTERNAL_VDB_TOKEN"] == "internal-validation-token"
