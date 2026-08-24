@@ -31,21 +31,26 @@ docker compose -f nemo_retriever/dev/compose/service-mode.compose.yaml up --buil
 curl -fsSL http://localhost:7670/v1/health
 ```
 
-The same default stack exposes collection and document lifecycle APIs. Optional
-runtime tokens enable a public bearer credential and a separate credential for
-the private Retriever-to-VectorDB hop:
+The same default stack exposes collection and document lifecycle APIs. To
+exercise authentication, enable it explicitly and configure a public bearer
+credential, its authorized scope, and a separate credential for the private
+Retriever-to-VectorDB hop:
 
 ```bash
+export NRL_AUTH_ENABLED=true
 export NRL_API_TOKEN="<development-api-token>"
 export NRL_INTERNAL_VDB_TOKEN="<internal-service-token>"
+export NRL_SCOPE=default
+export NRL_ALLOW_UNSCOPED_DEV=false
 docker compose -f nemo_retriever/dev/compose/service-mode.compose.yaml up --build -d
 ```
 
-Leave both values unset to preserve the existing unauthenticated development
-experience. In this default Compose configuration, `NRL_API_TOKEN` is bound to
-the `default` scope, so clients use `X-NRL-Scope: default` (or SDK
-`scope="default"`). Multi-scope deployments use the service's Secret-backed
-token mapping. Tokens are runtime inputs and must not be committed.
+Leave `NRL_AUTH_ENABLED` unset to preserve the existing unauthenticated
+development experience. When authentication is enabled, `NRL_API_TOKEN` is
+bound to `NRL_SCOPE`, which defaults to `default`. Clients use the same value
+in `X-NRL-Scope` or SDK `scope`. Multi-scope deployments use the service's
+Secret-backed token mapping. Tokens are runtime inputs and must not be
+committed.
 
 Endpoints, models, ports, worker counts, and the service image can all be
 overridden explicitly. The most commonly tuned variables are
@@ -54,6 +59,67 @@ overridden explicitly. The most commonly tuned variables are
 `PIPELINE_REALTIME_WORKERS`, `PIPELINE_REALTIME_QUEUE_SIZE`,
 `PIPELINE_BATCH_WORKERS`, and `PIPELINE_BATCH_QUEUE_SIZE`. Explicit shell
 variables override preset values, enabling mixed hosted/self-hosted stacks.
+
+## Hosted agentic retrieval
+
+Agentic retrieval is disabled in the base stack. Layer the agentic Compose
+override to configure both the gateway and the VectorDB process for a remote
+OpenAI-compatible chat-completions endpoint. The overlay requires an agent
+model and invoke URL when Compose renders the stack.
+
+Set these values in your shell or an ignored environment file. The repository
+does not provide an agentic preset because credentials and endpoint choices are
+deployment-specific.
+
+```bash
+export NVIDIA_API_KEY=nvapi-...
+export AGENTIC_ENABLED=true
+export AGENTIC_LLM_MODEL=nvidia/llama-3.3-nemotron-super-49b-v1.5
+export AGENTIC_INVOKE_URL=https://integrate.api.nvidia.com/v1/chat/completions
+export NIM_EMBED_URL=https://integrate.api.nvidia.com/v1/embeddings
+export NIM_EMBED_MODEL=nvidia/llama-nemotron-embed-vl-1b-v2
+
+export NRL_AUTH_ENABLED=true
+export NRL_API_TOKEN="<development-api-token>"
+export NRL_INTERNAL_VDB_TOKEN="<different-internal-service-token>"
+export NRL_SCOPE=aiq-agentic-poc
+export NRL_ALLOW_UNSCOPED_DEV=false
+
+docker compose \
+  -f nemo_retriever/dev/compose/service-mode.compose.yaml \
+  -f nemo_retriever/dev/compose/service-mode.agentic.compose.yaml \
+  config --quiet
+docker compose \
+  -f nemo_retriever/dev/compose/service-mode.compose.yaml \
+  -f nemo_retriever/dev/compose/service-mode.agentic.compose.yaml \
+  up --build -d retriever
+```
+
+The hosted endpoints use `NVIDIA_API_KEY`. To limit development cost and
+latency, set `AGENTIC_REACT_MAX_STEPS=8`; the default remains `50`. Other
+optional controls are `AGENTIC_REASONING_EFFORT`, `AGENTIC_BACKEND_TOP_K`,
+`AGENTIC_TEXT_TRUNCATION`, `AGENTIC_TEMPERATURE`, and
+`AGENTIC_MAX_TOKENS`. Service mode defaults `AGENTIC_MAX_TOKENS` to `1024`,
+which bounds each ReAct and selection-agent completion. `AGENTIC_REQUEST_TIMEOUT_S`
+is the outer gateway/MCP request timeout; it does not change individual LLM call
+timeouts.
+
+After you ingest documents into a logical collection, query that collection
+through the public gateway:
+
+```bash
+curl -fsSL -X POST http://localhost:7670/v1/query \
+  -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer ${NRL_API_TOKEN}" \
+  -H "X-NRL-Scope: ${NRL_SCOPE}" \
+  --data '{"query":"What is in this collection?","collection_name":"s_example","top_k":5,"format":"hits","agentic":true}'
+```
+
+A successful response sets `query_mode` to `agentic`. For collection-bound
+queries, the agent's opaque `doc_id` equals the selected `chunk_id` while the
+canonical `document_id` remains unchanged. The returned nonnegative `distance`
+is the native vector distance from the retrieval hop, not the final agentic
+ranking score. Use `rank` and response order for the final ranking.
 
 ## Self-hosted NIM profiles
 

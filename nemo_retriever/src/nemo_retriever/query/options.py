@@ -75,6 +75,8 @@ class QueryAgenticOptions:
     # Accepted for service-layer compatibility only. The agent derives its own
     # per-hop retrieval depth from ``top_k``, so this value is never read.
     backend_top_k: int | None = None
+    # Optional upper bound on each ReAct and selection-agent completion.
+    max_tokens: int | None = None
 
 
 @dataclass(frozen=True)

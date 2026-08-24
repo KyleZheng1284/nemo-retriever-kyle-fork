@@ -1,8 +1,10 @@
 # Workflow: Agentic retrieval
 
-Use this workflow after you have ingested documents into a LanceDB table. Agentic retrieval does not ingest files. It queries the same table, embedding model, and storage flags as one-pass `retriever query`.
+Use this workflow after you have ingested documents into a fixed table or
+logical collection. Agentic retrieval does not ingest files. It queries the
+same retrieval data and embedding model as the corresponding one-pass query.
 
-**Agentic retrieval** runs a large language model (LLM) Reason and Act (ReAct) loop: the agent issues several retrieval sub-queries, fuses candidates with reciprocal rank fusion, and selects a final document ranking. **One-pass retrieval** sends a single dense or hybrid query and returns text-enriched chunk hits. For the concept distinction, refer to [Agentic retrieval (concept)](agentic-retrieval-concept.md).
+**Agentic retrieval** runs a large language model (LLM) Reason and Act (ReAct) loop: the agent issues several retrieval sub-queries, fuses candidates with reciprocal rank fusion, and selects a final candidate ranking. **One-pass retrieval** sends a single dense or hybrid query and returns text-enriched chunk hits. For the concept distinction, refer to [Agentic retrieval (concept)](agentic-retrieval-concept.md).
 
 ## Query with the CLI { #query-with-the-cli }
 
@@ -166,12 +168,67 @@ agentic:
   reasoning_effort: high
   backend_top_k: 20
   react_max_steps: 50
+  max_tokens: 1024
   request_timeout_s: 1800
 ```
 
 `agentic.invoke_url` and `agentic.llm_model` are required when `agentic.enabled` is true. The VectorDB process owns the LanceDB volume and executes the agentic workflow. Start it with matching `--agentic`, `--agentic-llm-model`, and `--agentic-invoke-url` options. LLM and embedding credentials are resolved from the service process environment (`NVIDIA_API_KEY`, then `NGC_API_KEY`).
 
+`agentic.max_tokens` bounds each ReAct and selection-agent completion. `agentic.request_timeout_s` is the outer gateway/MCP timeout for the complete agentic query and is not forwarded as an individual LLM call timeout.
+
 Agentic service requests use the configured remote embedding endpoint for retrieval. The result-selection graph does not require a local embedding model or Hugging Face cache.
+
+### Run hosted agentic retrieval with Docker Compose { #docker-compose-hosted-agentic }
+
+The development Compose stack keeps agentic retrieval disabled by default. Use
+the agentic override with remote embedding and chat-completions endpoints. Set
+the values in your shell or an ignored environment file.
+
+```bash
+export NVIDIA_API_KEY=nvapi-...
+export AGENTIC_ENABLED=true
+export AGENTIC_LLM_MODEL=nvidia/llama-3.3-nemotron-super-49b-v1.5
+export AGENTIC_INVOKE_URL=https://integrate.api.nvidia.com/v1/chat/completions
+export NIM_EMBED_URL=https://integrate.api.nvidia.com/v1/embeddings
+export NIM_EMBED_MODEL=nvidia/llama-nemotron-embed-vl-1b-v2
+
+docker compose \
+  -f nemo_retriever/dev/compose/service-mode.compose.yaml \
+  -f nemo_retriever/dev/compose/service-mode.agentic.compose.yaml \
+  config --quiet
+docker compose \
+  -f nemo_retriever/dev/compose/service-mode.compose.yaml \
+  -f nemo_retriever/dev/compose/service-mode.agentic.compose.yaml \
+  up --build -d retriever
+```
+
+The overlay requires `AGENTIC_LLM_MODEL` and `AGENTIC_INVOKE_URL` when Compose
+renders the stack. The same `NVIDIA_API_KEY` authenticates the hosted embedding
+and chat-completions calls in this development configuration.
+
+For a scoped static-token deployment, also set these values before startup:
+
+```bash
+export NRL_AUTH_ENABLED=true
+export NRL_API_TOKEN="<development-api-token>"
+export NRL_INTERNAL_VDB_TOKEN="<different-internal-service-token>"
+export NRL_SCOPE=aiq-agentic-poc
+export NRL_ALLOW_UNSCOPED_DEV=false
+```
+
+Send the public token and configured scope on collection queries:
+
+```bash
+curl -fsSL -X POST http://localhost:7670/v1/query \
+  -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer ${NRL_API_TOKEN}" \
+  -H "X-NRL-Scope: ${NRL_SCOPE}" \
+  --data '{"query":"find documents about parser behavior","collection_name":"s_example","top_k":5,"format":"hits","agentic":true}'
+```
+
+The public token is not forwarded to VectorDB. The gateway uses
+`NRL_INTERNAL_VDB_TOKEN` for that private hop. Each retrieval step remains
+bound to the authorized scope and logical collection.
 
 On Kubernetes, the Helm chart maps the same knobs under `serviceConfig.agentic`. Enabling `nimOperator.answer_llm` does not populate this block. Refer to [Self-hosted Helm Super-49B](#self-hosted-helm-super-49b) and the [Helm chart README](https://github.com/NVIDIA/NeMo-Retriever/blob/main/nemo_retriever/helm/README.md#agentic-retrieval-llm).
 
@@ -221,11 +278,11 @@ The `ingest_documents` MCP tool accepts either paths visible to the MCP server p
 
 ## Result contract { #result-contract }
 
-One-pass retrieval returns text-enriched chunk hits. Agentic retrieval ranks documents, and returns the same hit fields as one-pass retrieval for each selected document. The agent works with reduced candidate records internally, but the selected documents are rehydrated at the end of the loop from the retrieval hop that returned them.
+One-pass retrieval returns text-enriched chunk hits. Agentic retrieval ranks opaque selection IDs and returns the same hit fields for each selected candidate. The agent works with reduced candidate records internally, but selected candidates are rehydrated from the retrieval hop that returned them.
 
 Every agentic hit carries the one-pass hit fields (`text`, `metadata`, `source`, `source_id`, `path`, `page_number`, `pdf_basename`, `pdf_page`, scores, and related) plus these agentic annotations:
 
-- `doc_id` — the document identifier the agent selected.
+- `doc_id` — the opaque identifier the agent selected.
 - `rank` — the position in the final ranking.
 - `result_source` — `final_results`, `rrf`, or `selection_agent`, depending on which stage produced the ranked ID.
 
@@ -233,7 +290,16 @@ CLI `retriever query --agentic` prints those hits as JSON objects.
 
 Service `POST /v1/query` with `agentic=true` uses the same hits envelope as classic retrieval. Successful responses set `query_mode` to `"agentic"`. Classic dense or hybrid `/v1/query` (including `format=evidence`) sets `query_mode` to `"classic"`. For backward compatibility with the previous agentic service contract, service and MCP hits also copy `rank` and `result_source` under `metadata`; the top-level fields are authoritative and carry the same values.
 
-An agent can name a document that no retrieval hop returned, which leaves nothing to rehydrate. Those hits report null one-pass fields, and `source` falls back to `doc_id`.
+For a collection-bound service request, `doc_id` equals the selected
+`chunk_id`. The canonical `document_id` remains unchanged, so multiple chunks
+from one document cannot collide during agent selection. Fixed-table CLI and
+service requests continue to use their configured document ID field.
+
+Collection-bound hits retain the nonnegative native vector `distance` from the
+retrieval hop that found the chunk. This value is not the final agentic score.
+Use `rank` and response order for the final ranking.
+
+An agent can name an ID that no retrieval hop returned, which leaves nothing to rehydrate. Those hits report null one-pass fields, and `source` falls back to `doc_id`.
 
 ## Failure and retry behavior { #failure-and-retry-behavior }
 
@@ -257,7 +323,7 @@ Agentic runs use a dedicated worker pool in the VectorDB process so they cannot 
 - Local CLI and harness runs need a CUDA GPU host and the `[local]` extra. `super-49b` needs two visible GPUs and `--agentic-local-tensor-parallel-size 2`.
 - Retriever Service agentic queries require a remote chat-completions URL, a remote embedding endpoint, and matching credentials in the process environment.
 - The default Helm `answer_llm` Super-49B NIM is limited to `POST /v1/answer` until you add the tool-call passthrough arguments. Enabling `nimOperator.answer_llm` does not configure `serviceConfig.agentic`.
-- Agentic results are document IDs, not chunk text. Downstream answer generation must load source documents by those IDs if it needs passage text.
+- Fixed-table agentic paths select their configured document IDs. Collection-bound service requests select chunk IDs and return rehydrated chunk text and canonical document IDs.
 - Service agentic queries accept a single query string, `format=hits` only, and cannot combine `rerank=true` on the same `/v1/query` request. On the CLI, `--rerank` applies to each agent retrieve hop.
 
 ## Related Topics { #related-topics }

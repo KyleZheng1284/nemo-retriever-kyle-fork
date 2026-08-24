@@ -1,0 +1,42 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.
+# All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Structural override for service-mode agentic retrieval. Use together with
+# service-mode.compose.yaml and remote OpenAI-compatible embedding and chat
+# endpoints. Agentic retrieval is disabled in the base stack.
+services:
+  vectordb:
+    command:
+      - python
+      - -m
+      - nemo_retriever.service.vectordb_app
+      - --lancedb-uri
+      - /data/vectordb
+      - --table-name
+      - nemo_retriever
+      - --embed-endpoint
+      - ${NIM_EMBED_URL:-https://integrate.api.nvidia.com/v1/embeddings}
+      - --embed-model
+      - ${NIM_EMBED_MODEL:-nvidia/llama-nemotron-embed-vl-1b-v2}
+      - --agentic
+      - --agentic-llm-model
+      - ${AGENTIC_LLM_MODEL:?Set AGENTIC_LLM_MODEL for agentic retrieval}
+      - --agentic-invoke-url
+      - ${AGENTIC_INVOKE_URL:?Set AGENTIC_INVOKE_URL for agentic retrieval}
+      - --agentic-reasoning-effort
+      - ${AGENTIC_REASONING_EFFORT:-high}
+      - --agentic-backend-top-k
+      - ${AGENTIC_BACKEND_TOP_K:-20}
+      - --agentic-react-max-steps
+      - ${AGENTIC_REACT_MAX_STEPS:-50}
+      - --agentic-text-truncation
+      - ${AGENTIC_TEXT_TRUNCATION:-0}
+      - --agentic-temperature
+      - ${AGENTIC_TEMPERATURE:-0}
+      - --agentic-max-tokens
+      - ${AGENTIC_MAX_TOKENS:-1024}
+      - --agentic-request-timeout
+      - ${AGENTIC_REQUEST_TIMEOUT_S:-1800}
+      - --port
+      - "7671"

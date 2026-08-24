@@ -173,6 +173,55 @@ def test_agentic_retriever_caches_untruncated_text_for_rehydration():
     assert retriever._hit_cache[("q1", "doc_1")]["text"] == "matching document"
 
 
+def test_agentic_retriever_uses_canonical_hit_callback_without_physical_retriever():
+    from nemo_retriever.query.agentic import AgenticRetrievalConfig, AgenticRetriever
+
+    retrieve_hits = MagicMock(
+        return_value=[
+            {
+                "chunk_id": "chunk-1",
+                "document_id": "document-1",
+                "text": "first chunk",
+                "distance": 0.2,
+                "filename": "report.pdf",
+            },
+            {
+                "chunk_id": "chunk-2",
+                "document_id": "document-1",
+                "text": "second chunk",
+                "distance": 0.4,
+                "filename": "report.pdf",
+            },
+        ]
+    )
+    cfg = AgenticRetrievalConfig(llm_model="m", invoke_url=_REMOTE_URL)
+
+    with patch("nemo_retriever.query.agentic.Retriever") as physical_retriever:
+        retriever = AgenticRetriever(
+            cfg,
+            doc_id_field="chunk_id",
+            retrieve_hits_fn=retrieve_hits,
+        )
+
+    physical_retriever.assert_not_called()
+
+    docs = retriever._retrieve_for_agent("rewritten query", 2, query_id="q1")
+
+    retrieve_hits.assert_called_once_with("rewritten query", 2)
+    assert docs == [
+        {"doc_id": "chunk-1", "text": "first chunk", "score": -0.2},
+        {"doc_id": "chunk-2", "text": "second chunk", "score": -0.4},
+    ]
+    assert retriever._hit_cache[("q1", "chunk-1")] == {
+        "chunk_id": "chunk-1",
+        "document_id": "document-1",
+        "text": "first chunk",
+        "distance": 0.2,
+        "filename": "report.pdf",
+    }
+    assert retriever._hit_cache[("q1", "chunk-2")]["document_id"] == "document-1"
+
+
 def test_rehydrated_agentic_hit_layers_annotations_onto_classic_fields():
     from nemo_retriever.query.agentic import rehydrated_agentic_hit
 
@@ -273,8 +322,13 @@ def test_agentic_query_documents_returns_classic_hit_fields_with_annotations():
         agentic=QueryAgenticOptions(enabled=True, llm_model="m", invoke_url=_REMOTE_URL),
     )
 
-    with patch("nemo_retriever.query.workflow.build_agentic_retriever", return_value=retriever):
-        ranked = agentic_query_documents(request)
+    retrieve_hits = MagicMock()
+    with patch("nemo_retriever.query.workflow.build_agentic_retriever", return_value=retriever) as build_retriever:
+        ranked = agentic_query_documents(
+            request,
+            retrieve_hits_fn=retrieve_hits,
+            doc_id_field="chunk_id",
+        )
 
     assert ranked == [
         {
@@ -287,6 +341,11 @@ def test_agentic_query_documents_returns_classic_hit_fields_with_annotations():
         },
         {"doc_id": "invented", "rank": 2, "result_source": "final_results"},
     ]
+    build_retriever.assert_called_once_with(
+        request,
+        retrieve_hits_fn=retrieve_hits,
+        doc_id_field="chunk_id",
+    )
     retriever.unload.assert_called_once()
 
 

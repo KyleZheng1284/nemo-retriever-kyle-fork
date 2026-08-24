@@ -127,6 +127,7 @@ agentic:
   react_max_steps: 50
   text_truncation: 0
   temperature: 0.0
+  max_tokens: 1024
   request_timeout_s: 1800.0
 
 # Pipeline worker pools.  Workers are abstract dispatchers — sizing

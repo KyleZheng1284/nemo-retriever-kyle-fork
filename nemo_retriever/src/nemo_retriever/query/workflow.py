@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from nemo_retriever.query.agentic import AgenticRetrievalConfig, AgenticRetriever
+    from nemo_retriever.query.agentic import AgenticHitRetriever, AgenticRetrievalConfig, AgenticRetriever
 
 from nemo_retriever.common.params import build_embed_option_kwargs
 from nemo_retriever.common.remote_auth import resolve_remote_api_key
@@ -189,6 +189,7 @@ def build_agentic_config(request: QueryRequest, *, top_k: int | None = None) -> 
         "num_concurrent": int(request.agentic.num_concurrent),
         "temperature": request.agentic.temperature,
         "llm_client": request.agentic.llm_client,
+        "max_tokens": request.agentic.max_tokens,
     }
     if request.agentic.llm_backend:
         cfg_kwargs["llm_backend"] = request.agentic.llm_backend
@@ -208,29 +209,50 @@ def build_agentic_config(request: QueryRequest, *, top_k: int | None = None) -> 
     return AgenticRetrievalConfig(**cfg_kwargs)
 
 
-def build_agentic_retriever(request: QueryRequest) -> "AgenticRetriever":
+def build_agentic_retriever(
+    request: QueryRequest,
+    *,
+    retrieve_hits_fn: "AgenticHitRetriever | None" = None,
+    doc_id_field: str | None = None,
+) -> "AgenticRetriever":
     """Construct an :class:`AgenticRetriever` from a :class:`QueryRequest`."""
     from nemo_retriever.query.agentic import AgenticRetriever
 
-    return AgenticRetriever(build_agentic_config(request))
+    retriever_kwargs: dict[str, Any] = {}
+    if retrieve_hits_fn is not None:
+        retriever_kwargs["retrieve_hits_fn"] = retrieve_hits_fn
+    if doc_id_field is not None:
+        retriever_kwargs["doc_id_field"] = doc_id_field
+    return AgenticRetriever(build_agentic_config(request), **retriever_kwargs)
 
 
-def agentic_query_documents(request: QueryRequest) -> list[dict[str, Any]]:
+def agentic_query_documents(
+    request: QueryRequest,
+    *,
+    retrieve_hits_fn: "AgenticHitRetriever | None" = None,
+    doc_id_field: str | None = None,
+) -> list[dict[str, Any]]:
     """Run agentic (ReAct) retrieval for a single query and return ranked hits.
 
-    The agent selects documents rather than chunks, but each returned hit carries
-    the same fields as the dense ``query_documents`` path (``text``, ``source``,
-    ``page_number``, ``metadata``, …), rehydrated from the retrieve hop that
-    returned the document, plus the agentic annotations ``doc_id``, ``rank``, and
-    ``result_source`` (``final_results`` / ``rrf`` / ``selection_agent``). The
-    LanceDB ``uri``/``table_name``, embedding config, and (when ``--rerank`` is
-    enabled) reranker config are passed straight through to the wrapped
-    ``Retriever`` that backs the agent's ``retrieve`` tool. Reranking therefore
-    applies per agent retrieval hop.
+    The agent selects opaque retrieval candidates: fixed-table queries use their
+    configured document identifier, while collection queries use ``chunk_id``.
+    Each returned hit carries the same fields as the dense ``query_documents``
+    path (``text``, ``source``, ``page_number``, ``metadata``, …), rehydrated
+    from the retrieve hop that returned the candidate, plus the agentic
+    annotations ``doc_id``, ``rank``, and ``result_source`` (``final_results`` /
+    ``rrf`` / ``selection_agent``).
+    Without a retrieval callback, LanceDB ``uri``/``table_name``, embedding
+    config, and (when ``--rerank`` is enabled) reranker config are passed to the
+    wrapped ``Retriever`` that backs the agent's ``retrieve`` tool. Callback
+    mode delegates each retrieval hop to its caller.
     """
     from nemo_retriever.query.agentic import rehydrated_agentic_hit
 
-    retriever = build_agentic_retriever(request)
+    retriever = build_agentic_retriever(
+        request,
+        retrieve_hits_fn=retrieve_hits_fn,
+        doc_id_field=doc_id_field,
+    )
     try:
         result = retriever.retrieve(["0"], [str(request.query)])
         if "rank" in result.columns:

@@ -196,6 +196,26 @@ keep their existing modality-specific metadata rather than being converted
 into document pages. This contract is identical regardless of the network
 path used to reach the service.
 
+Collection-bound agentic retrieval uses the same public query route. Set
+`agentic` to `true` and send the logical collection name, public token, and
+authorized scope:
+
+```bash
+curl -fsSL -X POST http://localhost:7670/v1/query \
+  -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer ${NRL_API_TOKEN}" \
+  -H "X-NRL-Scope: ${NRL_SCOPE}" \
+  --data '{"query":"What are the major findings?","collection_name":"research-session","top_k":5,"format":"hits","agentic":true}'
+```
+
+Successful responses set `query_mode` to `agentic`. Each hit uses its stable
+`chunk_id` as the agent's opaque `doc_id` and retains the canonical
+`document_id`. The native nonnegative `distance` identifies the retrieval hop
+that found the chunk; it is not the final agentic ranking score. Use the
+one-based `rank` and response order for final ranking. The Python service client
+continues to expose classic collection queries in this release, so applications
+that opt into agentic collection retrieval call the REST route directly.
+
 For `format=evidence`, each evidence item's `score` is the same native dense
 vector distance, not a normalized confidence or probability. Lower is better,
 and values are not comparable across queries.

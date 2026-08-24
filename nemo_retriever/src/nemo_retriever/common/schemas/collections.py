@@ -151,6 +151,7 @@ class QueryHit(RichModel):
     document_id: DocumentId
     text: str
     distance: float = Field(
+        ge=0.0,
         allow_inf_nan=False,
         description="Native dense-vector distance; lower values are more similar.",
     )

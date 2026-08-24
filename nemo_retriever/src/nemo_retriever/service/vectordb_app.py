@@ -675,10 +675,9 @@ def create_vectordb_app(
         x_nrl_scope: str | None = Header(None),
     ) -> QueryResponse | EvidenceQueryResponse:
         current = require_state()
+        scope = _scope(x_nrl_scope)
         if req.agentic:
-            if req.collection_name is not None:
-                raise UnsupportedVDBOperation("agentic collection retrieval")
-            return await _run_agentic_query(req)
+            return await _run_agentic_query(req, scope=scope)
 
         if current.embed_mode == "none":
             raise HTTPException(
@@ -705,7 +704,7 @@ def create_vectordb_app(
                 result = await asyncio.to_thread(
                     current.retrieve_operator.run,
                     vectors,
-                    scope=_scope(x_nrl_scope),
+                    scope=scope,
                     collection_name=req.collection_name,
                     query_texts=queries,
                     top_k=req.top_k,
@@ -731,7 +730,7 @@ def create_vectordb_app(
             )
         return QueryResponse(results=[QueryResult(hits=hits) for hits in hits_per_query])
 
-    async def _run_agentic_query(req: QueryRequest) -> QueryResponse:
+    async def _run_agentic_query(req: QueryRequest, *, scope: str) -> QueryResponse:
         """Run the blocking agentic workflow without consuming plain-query workers."""
         current = require_state()
         if not agentic_config.enabled:
@@ -751,13 +750,43 @@ def create_vectordb_app(
             )
         if current.embed_mode != "remote":
             raise HTTPException(501, "Agentic service queries require a remote embedding endpoint.")
-        if not current.table_exists:
-            raise VDBInvalidRequest("No data has been ingested yet. Ingest documents first, then query.")
         if req.top_k > agentic_config.backend_top_k:
             raise VDBInvalidRequest(
                 f"top_k ({req.top_k}) cannot exceed the configured agentic "
                 f"backend_top_k ({agentic_config.backend_top_k})."
             )
+
+        agentic_runner_kwargs: dict[str, Any] = {}
+        if req.collection_name is not None:
+            collection_name = req.collection_name
+            await asyncio.to_thread(
+                current.vdb.get_collection,
+                scope=scope,
+                collection_name=collection_name,
+            )
+
+            def retrieve_collection_hits(query_text: str, top_k: int) -> list[dict[str, Any]]:
+                vectors = current.embed_queries([query_text])
+                result = current.retrieve_operator.run(
+                    vectors,
+                    scope=scope,
+                    collection_name=collection_name,
+                    query_texts=[query_text],
+                    top_k=top_k,
+                )
+                if not isinstance(result, tuple):
+                    raise RetrievalContractError("Collection retrieval did not return strategies")
+                hits_per_query, _strategies = result
+                if len(hits_per_query) != 1:
+                    raise RetrievalContractError("Agentic collection retrieval must return exactly one result set")
+                return hits_per_query[0]
+
+            agentic_runner_kwargs = {
+                "retrieve_hits_fn": retrieve_collection_hits,
+                "doc_id_field": "chunk_id",
+            }
+        elif not current.table_exists:
+            raise VDBInvalidRequest("No data has been ingested yet. Ingest documents first, then query.")
 
         executor, slots = agentic_executor, agentic_slots
         if executor is None or slots is None:
@@ -789,6 +818,7 @@ def create_vectordb_app(
                 embed_model=current.embed_model,
                 embed_model_provider_prefix=current.embed_model_provider_prefix,
                 embed_api_key=current.embed_api_key,
+                **agentic_runner_kwargs,
             )
         except RuntimeError as exc:
             slots.release()
@@ -890,6 +920,7 @@ def main() -> None:
     parser.add_argument("--agentic-react-max-steps", type=int, default=50)
     parser.add_argument("--agentic-text-truncation", type=int, default=0)
     parser.add_argument("--agentic-temperature", type=float, default=0.0)
+    parser.add_argument("--agentic-max-tokens", type=int, default=1024)
     parser.add_argument("--agentic-request-timeout", type=float, default=1800.0)
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=7671)
@@ -930,6 +961,7 @@ def main() -> None:
             react_max_steps=args.agentic_react_max_steps,
             text_truncation=args.agentic_text_truncation,
             temperature=args.agentic_temperature,
+            max_tokens=args.agentic_max_tokens,
             request_timeout_s=args.agentic_request_timeout,
         ),
     )

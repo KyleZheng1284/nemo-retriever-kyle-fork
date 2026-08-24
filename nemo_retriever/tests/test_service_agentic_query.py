@@ -5,17 +5,20 @@
 from __future__ import annotations
 
 import json
-from unittest.mock import PropertyMock, patch
+import sys
+from unittest.mock import MagicMock, PropertyMock, call, patch
 
 import pytest
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
 import nemo_retriever.service.vectordb_app as vectordb_module
+from nemo_retriever.common.vdb.adt_vdb import VDBResourceNotFound
 from nemo_retriever.service.app import create_app
 from nemo_retriever.service.agentic_query import (
     agentic_ranked_to_hits,
     build_agentic_query_request,
+    run_agentic_query,
 )
 from nemo_retriever.service.config import (
     AgenticConfig,
@@ -35,6 +38,9 @@ from nemo_retriever.service.vectordb_app import VectorDBState, create_vectordb_a
 
 
 def test_agentic_service_config_requires_remote_model_and_endpoint() -> None:
+    assert AgenticConfig().max_tokens == 1024
+    with pytest.raises(ValidationError, match="greater than or equal to 1"):
+        AgenticConfig(max_tokens=0)
     with pytest.raises(ValidationError, match="agentic.invoke_url"):
         AgenticConfig(enabled=True, llm_model="model")
     with pytest.raises(ValidationError, match="agentic.llm_model"):
@@ -63,6 +69,7 @@ def test_build_agentic_query_request_maps_server_owned_configuration() -> None:
             invoke_url="https://llm.example/v1/chat/completions",
             backend_top_k=25,
             react_max_steps=7,
+            max_tokens=2048,
         ),
         lancedb_uri="/indexes/finance",
         table_name="finance",
@@ -85,6 +92,67 @@ def test_build_agentic_query_request_maps_server_owned_configuration() -> None:
     assert request.agentic.invoke_url == "https://llm.example/v1/chat/completions"
     assert request.agentic.backend_top_k == 25
     assert request.agentic.react_max_steps == 7
+    assert request.agentic.max_tokens == 2048
+
+
+def test_vectordb_main_maps_agentic_max_tokens(monkeypatch) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "vectordb_app",
+            "--agentic",
+            "--agentic-llm-model",
+            "model",
+            "--agentic-invoke-url",
+            "https://llm.example/v1/chat/completions",
+            "--agentic-max-tokens",
+            "2048",
+        ],
+    )
+    create_app = MagicMock(return_value=MagicMock())
+    monkeypatch.setattr(vectordb_module, "create_vectordb_app", create_app)
+    monkeypatch.setattr(vectordb_module.uvicorn, "run", MagicMock())
+
+    vectordb_module.main()
+
+    assert create_app.call_args.kwargs["agentic_config"].max_tokens == 2048
+
+
+def test_run_agentic_query_threads_canonical_hit_callback() -> None:
+    retrieve_hits = MagicMock()
+    config = AgenticConfig(
+        enabled=True,
+        llm_model="model",
+        invoke_url="https://llm.example/v1/chat/completions",
+    )
+
+    with patch(
+        "nemo_retriever.service.agentic_query.agentic_query_documents",
+        return_value=[],
+    ) as query_documents:
+        response = run_agentic_query(
+            query="revenue trend",
+            top_k=3,
+            config=config,
+            lancedb_uri="/indexes/finance",
+            table_name="finance",
+            embed_endpoint="https://embed.example/v1/embeddings",
+            embed_model="embed-model",
+            embed_model_provider_prefix="openai",
+            embed_api_key="embed-key",
+            retrieve_hits_fn=retrieve_hits,
+            doc_id_field="chunk_id",
+        )
+
+    assert response.query_mode == "agentic"
+    workflow_request = query_documents.call_args.args[0]
+    assert workflow_request.query == "revenue trend"
+    query_documents.assert_called_once_with(
+        workflow_request,
+        retrieve_hits_fn=retrieve_hits,
+        doc_id_field="chunk_id",
+    )
 
 
 def test_agentic_ranked_to_hits_keeps_rehydrated_classic_fields() -> None:
@@ -155,10 +223,33 @@ def test_agentic_query_flag_rejected_when_disabled(tmp_path) -> None:
     assert "not enabled" in response.json()["detail"]
 
 
-def test_agentic_query_rejects_collection_target(tmp_path) -> None:
+def test_agentic_query_binds_each_scope_to_its_logical_collection(tmp_path) -> None:
+    backend = MagicMock()
+
+    def retrieve_collection(_vectors, *, scope, collection_name, query_texts, top_k, **_kwargs):
+        return (
+            [
+                [
+                    {
+                        "chunk_id": f"{scope}-chunk",
+                        "document_id": f"{scope}-document",
+                        "text": f"hit for {scope}",
+                        "distance": 0.2,
+                        "filename": f"{scope}.pdf",
+                        "metadata": {},
+                        "physical_table": f"private-{scope}",
+                    }
+                ]
+            ],
+            ["dense"],
+        )
+
+    backend.retrieve_collection.side_effect = retrieve_collection
     app = create_vectordb_app(
         lancedb_uri=str(tmp_path),
         embed_endpoint="https://embed.example/v1/embeddings",
+        vdb=backend,
+        reconciliation_interval_seconds=0,
         agentic_config=AgenticConfig(
             enabled=True,
             llm_model="model",
@@ -166,13 +257,103 @@ def test_agentic_query_rejects_collection_target(tmp_path) -> None:
         ),
     )
 
-    with TestClient(app) as client:
-        response = client.post(
-            "/v1/query",
-            json={"query": "q", "agentic": True, "collection_name": "workspace"},
+    def fake_agentic_query(**kwargs):
+        hits = kwargs["retrieve_hits_fn"]("rewritten query", 7)
+        selected = dict(hits[0])
+        selected.update(
+            {
+                "doc_id": selected["chunk_id"],
+                "rank": 1,
+                "result_source": "selection_agent",
+            }
+        )
+        return QueryResponse(
+            results=[QueryResult(hits=[selected])],
+            query_mode="agentic",
         )
 
-    assert response.status_code == 501
+    with (
+        patch.object(VectorDBState, "embed_queries", return_value=[[1.0, 0.0]]) as embed_queries,
+        patch.object(vectordb_module, "run_agentic_query", side_effect=fake_agentic_query) as run_query,
+        TestClient(app) as client,
+    ):
+        responses = [
+            client.post(
+                "/v1/query",
+                headers={"X-NRL-Scope": scope},
+                json={"query": "q", "agentic": True, "collection_name": "workspace"},
+            )
+            for scope in ("tenant-a", "tenant-b")
+        ]
+
+    assert [response.status_code for response in responses] == [200, 200]
+    assert [response.json()["results"][0]["hits"][0]["text"] for response in responses] == [
+        "hit for tenant-a",
+        "hit for tenant-b",
+    ]
+    for response, scope in zip(responses, ("tenant-a", "tenant-b")):
+        hit = response.json()["results"][0]["hits"][0]
+        assert hit["doc_id"] == f"{scope}-chunk"
+        assert hit["document_id"] == f"{scope}-document"
+        assert "physical_table" not in hit
+    assert [call.kwargs for call in backend.get_collection.call_args_list] == [
+        {"scope": "tenant-a", "collection_name": "workspace"},
+        {"scope": "tenant-b", "collection_name": "workspace"},
+    ]
+    assert [call.kwargs for call in backend.retrieve_collection.call_args_list] == [
+        {
+            "scope": "tenant-a",
+            "collection_name": "workspace",
+            "query_texts": ["rewritten query"],
+            "top_k": 7,
+        },
+        {
+            "scope": "tenant-b",
+            "collection_name": "workspace",
+            "query_texts": ["rewritten query"],
+            "top_k": 7,
+        },
+    ]
+    assert [call.args for call in backend.retrieve_collection.call_args_list] == [
+        ([[1.0, 0.0]],),
+        ([[1.0, 0.0]],),
+    ]
+    assert embed_queries.call_args_list == [call(["rewritten query"]), call(["rewritten query"])]
+    assert all(call.kwargs["doc_id_field"] == "chunk_id" for call in run_query.call_args_list)
+    backend.health.assert_not_called()
+
+
+def test_agentic_collection_query_preflights_before_starting_agent(tmp_path) -> None:
+    backend = MagicMock()
+    backend.get_collection.side_effect = VDBResourceNotFound("Collection not found")
+    app = create_vectordb_app(
+        lancedb_uri=str(tmp_path),
+        embed_endpoint="https://embed.example/v1/embeddings",
+        vdb=backend,
+        reconciliation_interval_seconds=0,
+        agentic_config=AgenticConfig(
+            enabled=True,
+            llm_model="model",
+            invoke_url="https://llm.example/v1/chat/completions",
+        ),
+    )
+
+    with (
+        patch.object(VectorDBState, "embed_queries") as embed_queries,
+        patch.object(vectordb_module, "run_agentic_query") as run_query,
+        TestClient(app) as client,
+    ):
+        response = client.post(
+            "/v1/query",
+            headers={"X-NRL-Scope": "tenant-a"},
+            json={"query": "q", "agentic": True, "collection_name": "missing"},
+        )
+
+    assert response.status_code == 404
+    backend.get_collection.assert_called_once_with(scope="tenant-a", collection_name="missing")
+    backend.health.assert_not_called()
+    embed_queries.assert_not_called()
+    run_query.assert_not_called()
 
 
 def test_agentic_true_runs_react_workflow_on_v1_query(tmp_path) -> None:

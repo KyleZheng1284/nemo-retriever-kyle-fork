@@ -324,6 +324,17 @@ configs:
         rag_system_prompt: ${ANSWER_LLM_RAG_SYSTEM_PROMPT_YAML:-null}
         rag_system_prompt_prefix: ${ANSWER_LLM_RAG_SYSTEM_PROMPT_PREFIX_YAML:-null}
         reasoning_enabled: ${ANSWER_LLM_REASONING_ENABLED:-true}
+      agentic:
+        enabled: ${AGENTIC_ENABLED:-false}
+        llm_model: ${AGENTIC_LLM_MODEL:-null}
+        invoke_url: ${AGENTIC_INVOKE_URL:-null}
+        reasoning_effort: ${AGENTIC_REASONING_EFFORT:-high}
+        backend_top_k: ${AGENTIC_BACKEND_TOP_K:-20}
+        react_max_steps: ${AGENTIC_REACT_MAX_STEPS:-50}
+        text_truncation: ${AGENTIC_TEXT_TRUNCATION:-0}
+        temperature: ${AGENTIC_TEMPERATURE:-0}
+        max_tokens: ${AGENTIC_MAX_TOKENS:-1024}
+        request_timeout_s: ${AGENTIC_REQUEST_TIMEOUT_S:-1800}
       pipeline:
         realtime_workers: ${PIPELINE_REALTIME_WORKERS:-24}
         realtime_queue_size: ${PIPELINE_REALTIME_QUEUE_SIZE:-2048}
@@ -332,8 +343,10 @@ configs:
       mcp:
         enabled: false
       auth:
+        enabled: ${NRL_AUTH_ENABLED:-false}
         api_token: "${NRL_API_TOKEN:-}"
-        allow_unscoped_dev: true
+        default_scope: "${NRL_SCOPE:-default}"
+        allow_unscoped_dev: ${NRL_ALLOW_UNSCOPED_DEV:-true}
       vectordb:
         enabled: true
         lancedb_uri: "/data/vectordb"

@@ -36,9 +36,10 @@ class QueryRequest(BaseModel):
             "Requires agentic.enabled in service configuration. Response uses the same "
             "hits envelope as dense/hybrid query: each hit carries the classic hit "
             "fields (text, metadata, source, page_number, scores, ...) plus doc_id, "
-            "rank, and result_source. For compatibility, metadata also carries rank "
-            "and result_source. Documents the agent selected without retrieving them "
-            "have null classic fields and source falls back to doc_id."
+            "rank, and result_source. Fixed-table requests select their configured "
+            "document IDs; collection-bound requests use chunk_id. For compatibility, "
+            "metadata also carries rank and result_source. Candidates selected without "
+            "a retrieval hit have null classic fields and source falls back to doc_id."
         ),
     )
 
@@ -111,7 +112,7 @@ class QueryResponse(BaseModel):
         default="classic",
         description=(
             "Which /v1/query workflow produced this response: 'classic' (dense/hybrid) "
-            "or 'agentic' (ReAct document ranking)."
+            "or 'agentic' (ReAct candidate ranking)."
         ),
     )
 

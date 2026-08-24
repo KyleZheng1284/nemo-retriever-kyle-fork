@@ -280,6 +280,7 @@ class AgenticConfig(RichModel):
     react_max_steps: int = Field(default=50, ge=1)
     text_truncation: int = Field(default=0, ge=0)
     temperature: float = Field(default=0.0, ge=0.0)
+    max_tokens: int = Field(default=1024, ge=1)
     request_timeout_s: float = Field(default=1800.0, gt=0)
 
     @model_validator(mode="after")

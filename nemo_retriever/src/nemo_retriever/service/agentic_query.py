@@ -6,7 +6,10 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from nemo_retriever.query.agentic import AgenticHitRetriever
 
 from nemo_retriever.query.options import (
     QueryAgenticOptions,
@@ -19,23 +22,24 @@ from nemo_retriever.query.workflow import agentic_query_documents
 from nemo_retriever.service.config import AgenticConfig
 from nemo_retriever.service.query_schema import QueryResponse, QueryResult
 
-
 #: Annotations the agentic workflow layers on top of the classic hit fields.
 _AGENTIC_ANNOTATION_FIELDS = frozenset({"doc_id", "rank", "result_source"})
 
 #: Classic fields reported as null when no retrieve hop captured the selected
-#: document, so the envelope keeps a stable key set either way.
+#: candidate, so the envelope keeps a stable key set either way.
 _UNRESOLVED_HIT_FIELDS = ("text", "source_id", "path", "page_number", "pdf_basename", "pdf_page")
 
 
 def agentic_ranked_to_hits(ranked: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Map agentic ranked hits onto the ``/v1/query`` hits envelope.
 
-    Agentic retrieval selects documents (``doc_id``), not chunks, but each hit
-    carries the classic chunk-level fields (``text``, ``metadata``, ``source``,
-    ``page_number``, scores, …) rehydrated from the retrieve hop that returned the
-    document, plus ``doc_id`` / ``rank`` / ``result_source``. When no hop captured
-    the document, those fields are null and ``source`` falls back to ``doc_id``.
+    Agentic retrieval selects opaque candidate IDs. Fixed-table requests use the
+    configured document ID, while collection-bound requests use ``chunk_id``.
+    Each hit carries the classic chunk-level fields (``text``, ``metadata``,
+    ``source``, ``page_number``, scores, …) rehydrated from the retrieve hop that
+    returned the candidate, plus ``doc_id`` / ``rank`` / ``result_source``. When
+    no hop captured the candidate, those fields are null and ``source`` falls
+    back to ``doc_id``.
 
     Rows without a non-empty ``doc_id`` are a contract violation: the agentic
     workflow already skips blank ids on retrieve hops, and a hit with
@@ -125,6 +129,7 @@ def build_agentic_query_request(
             react_max_steps=config.react_max_steps,
             text_truncation=config.text_truncation,
             temperature=config.temperature,
+            max_tokens=config.max_tokens,
         ),
     )
 
@@ -140,6 +145,8 @@ def run_agentic_query(
     embed_model: str,
     embed_model_provider_prefix: str | None,
     embed_api_key: str,
+    retrieve_hits_fn: "AgenticHitRetriever | None" = None,
+    doc_id_field: str | None = None,
 ) -> QueryResponse:
     """Execute one agentic retrieval query and return ``QueryResponse`` hits."""
     query_request = build_agentic_query_request(
@@ -153,7 +160,11 @@ def run_agentic_query(
         embed_model_provider_prefix=embed_model_provider_prefix,
         embed_api_key=embed_api_key,
     )
-    ranked = agentic_query_documents(query_request)
+    ranked = agentic_query_documents(
+        query_request,
+        retrieve_hits_fn=retrieve_hits_fn,
+        doc_id_field=doc_id_field,
+    )
     return QueryResponse(
         results=[QueryResult(hits=agentic_ranked_to_hits(ranked))],
         query_mode="agentic",

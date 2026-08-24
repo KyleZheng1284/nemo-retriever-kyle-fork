@@ -113,6 +113,17 @@ def test_query_hit_validates_canonical_page_instead_of_repairing_it() -> None:
         QueryHit(**payload, page_number=0)
 
 
+def test_query_hit_rejects_negative_distance() -> None:
+    with pytest.raises(ValidationError):
+        QueryHit(
+            chunk_id="chunk",
+            document_id="document",
+            text="text",
+            distance=-0.1,
+            filename="document.pdf",
+        )
+
+
 def test_canonical_record_batches_pass_through_without_reconversion() -> None:
     records = [
         [

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import logging
 import threading
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional, Sequence
@@ -67,10 +68,19 @@ AGENTIC_LOCAL_LLM_BACKENDS = frozenset({"vllm"})
 # are dropped from the hits kept for rehydration.
 _UNCACHED_HIT_FIELDS = frozenset({"vector", "embedding"})
 
-# Selection stages that can only rank documents a retrieve hop returned. A hit
+# Selection stages that can only rank candidates a retrieve hop returned. A hit
 # missing for one of these means the captured metadata and the selected ids
 # disagree, which is an internal inconsistency rather than agent behavior.
 _RETRIEVED_ONLY_RESULT_SOURCES = frozenset({"rrf", "selection_agent"})
+
+# Optional backend-neutral retrieval seam used by service-owned logical
+# collections. The callback returns the same canonical hit mappings consumed by
+# the classic collection path; AgenticRetriever remains responsible for
+# reducing them to the agent-facing doc_id/text/score shape and rehydrating the
+# selected hits afterward.
+AgenticHitRetriever = Callable[[str, int], Sequence[Mapping[str, Any]]]
+
+_VALID_AGENTIC_DOC_ID_FIELDS = VALID_BEIR_DOC_ID_FIELDS | {"chunk_id"}
 
 
 class AgenticQueryInputOperator(AbstractOperator):
@@ -359,46 +369,50 @@ class AgenticRetriever:
         *,
         match_mode: str = "pdf_page",
         doc_id_field: str | None = None,
+        retrieve_hits_fn: AgenticHitRetriever | None = None,
     ) -> None:
         self._cfg = cfg
         self._match_mode = str(match_mode)
         self._doc_id_field = str(doc_id_field) if doc_id_field else None
-        if self._doc_id_field is not None and self._doc_id_field not in VALID_BEIR_DOC_ID_FIELDS:
+        if self._doc_id_field is not None and self._doc_id_field not in _VALID_AGENTIC_DOC_ID_FIELDS:
             raise ValueError(f"Unsupported doc_id_field: {self._doc_id_field}")
-        embed_kwargs = build_embed_option_kwargs(
-            cfg.embedding_endpoint,
-            cfg.query_embedder,
-            embed_api_key=cfg.embedding_api_key,
-            embed_model_provider_prefix=cfg.query_embedder_provider_prefix,
-        )
-        if cfg.local_query_embed_backend is not None:
-            embed_kwargs["local_ingest_embed_backend"] = str(cfg.local_query_embed_backend)
-        embed_kwargs.update(
-            {
-                "input_type": "query",
-                "inference_batch_size": int(cfg.local_hf_batch_size),
-                "embed_inference_batch_size": int(cfg.local_hf_batch_size),
-            }
-        )
+        self._retrieve_hits_fn = retrieve_hits_fn
+        self._retriever: Retriever | None = None
+        if retrieve_hits_fn is None:
+            embed_kwargs = build_embed_option_kwargs(
+                cfg.embedding_endpoint,
+                cfg.query_embedder,
+                embed_api_key=cfg.embedding_api_key,
+                embed_model_provider_prefix=cfg.query_embedder_provider_prefix,
+            )
+            if cfg.local_query_embed_backend is not None:
+                embed_kwargs["local_ingest_embed_backend"] = str(cfg.local_query_embed_backend)
+            embed_kwargs.update(
+                {
+                    "input_type": "query",
+                    "inference_batch_size": int(cfg.local_hf_batch_size),
+                    "embed_inference_batch_size": int(cfg.local_hf_batch_size),
+                }
+            )
 
-        self._retriever = Retriever(
-            vdb_kwargs={
-                "vdb_op": str(cfg.vdb_op),
-                "vdb_kwargs": dict(cfg.vdb_kwargs or {}),
-            },
-            embed_kwargs=embed_kwargs,
-            top_k=AGENTIC_RETRIEVER_TOP_K,
-            rerank=bool(cfg.reranker),
-            rerank_kwargs={
-                "model_name": cfg.reranker or VL_RERANK_MODEL,
-                # NemotronRerankActor selects its remote CPU variant on
-                # ``rerank_invoke_url``; any other key silently loads a local model.
-                "rerank_invoke_url": (cfg.reranker_endpoint or "").strip() or None,
-                "api_key": cfg.reranker_api_key,
-                "local_reranker_backend": str(cfg.local_reranker_backend),
-                "modality": str(cfg.embed_modality),
-            },
-        )
+            self._retriever = Retriever(
+                vdb_kwargs={
+                    "vdb_op": str(cfg.vdb_op),
+                    "vdb_kwargs": dict(cfg.vdb_kwargs or {}),
+                },
+                embed_kwargs=embed_kwargs,
+                top_k=AGENTIC_RETRIEVER_TOP_K,
+                rerank=bool(cfg.reranker),
+                rerank_kwargs={
+                    "model_name": cfg.reranker or VL_RERANK_MODEL,
+                    # NemotronRerankActor selects its remote CPU variant on
+                    # ``rerank_invoke_url``; any other key silently loads a local model.
+                    "rerank_invoke_url": (cfg.reranker_endpoint or "").strip() or None,
+                    "api_key": cfg.reranker_api_key,
+                    "local_reranker_backend": str(cfg.local_reranker_backend),
+                    "modality": str(cfg.embed_modality),
+                },
+            )
         self._lock = threading.Lock()
         self._chat_completion_fn: Any | None = None
         # Classic hits keyed by (graph query_id, doc_id), captured on every
@@ -424,8 +438,8 @@ class AgenticRetriever:
 
         OpenAI-compatible endpoint mode is a no-op. Local vLLM mode shuts down
         this instance's EngineCore so CLI/harness jobs can exit cleanly. Embed
-        and rerank models stay on ``self._retriever`` and are released with the
-        process, matching dense harness BEIR behavior.
+        and rerank models, when present, stay on ``self._retriever`` and are
+        released with the process, matching dense harness BEIR behavior.
         """
 
         with self._lock:
@@ -526,7 +540,11 @@ class AgenticRetriever:
 
         candidate_k = max(int(self._cfg.candidate_k), int(top_k)) if self._cfg.candidate_k is not None else None
         with self._lock:
-            hits = self._retriever.query(str(query_text), top_k=int(top_k), candidate_k=candidate_k)
+            if self._retrieve_hits_fn is not None:
+                hits = self._retrieve_hits_fn(str(query_text), int(top_k))
+            else:
+                assert self._retriever is not None
+                hits = self._retriever.query(str(query_text), top_k=int(top_k), candidate_k=candidate_k)
 
         docs: list[dict[str, Any]] = []
         doc_id_field = getattr(self, "_doc_id_field", None)
@@ -569,13 +587,13 @@ def rehydrated_agentic_hit(hit: Any, *, doc_id: str, rank: int, result_source: s
     :meth:`AgenticRetriever.retrieve`. The result carries the classic
     ``RetrievalHit`` fields plus ``doc_id``, ``rank``, and ``result_source``, so
     agentic output matches classic retrieval output while still reporting which
-    stage selected the document.
+    stage selected the candidate.
 
     Args:
         hit: Rehydrated classic hit mapping from ``AgenticRetriever.retrieve``.
             Non-dict values represent unavailable hit metadata and produce an
             annotation-only result.
-        doc_id: Non-empty document identifier selected by the agentic pipeline.
+        doc_id: Non-empty opaque candidate identifier selected by the agentic pipeline.
         rank: One-based position in the final selected result list.
         result_source: Stage that produced the final selection, normally
             ``final_results``, ``selection_agent``, or ``rrf``.
@@ -710,9 +728,11 @@ def _hit_score(hit: dict[str, Any]) -> float:
                 return float(hit[key])
             except (TypeError, ValueError):
                 return 0.0
-    if "_distance" in hit:
+    for key in ("_distance", "distance"):
+        if key not in hit:
+            continue
         try:
-            return -float(hit["_distance"])
+            return -float(hit[key])
         except (TypeError, ValueError):
             return 0.0
     return 0.0

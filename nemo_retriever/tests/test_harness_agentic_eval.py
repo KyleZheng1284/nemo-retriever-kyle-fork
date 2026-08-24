@@ -112,6 +112,7 @@ def test_build_agentic_config_maps_request_and_top_k_override() -> None:
             invoke_url="http://localhost/v1/chat/completions",
             num_concurrent=4,
             temperature=0.0,
+            max_tokens=768,
         ),
     )
     cfg = build_agentic_config(request, top_k=10)
@@ -119,6 +120,7 @@ def test_build_agentic_config_maps_request_and_top_k_override() -> None:
     assert cfg.llm_backend == "openai_compatible"
     assert cfg.top_k == 10  # harness sets this to the deepest BEIR k
     assert cfg.num_concurrent == 4
+    assert cfg.max_tokens == 768
 
 
 def test_build_agentic_config_defaults_to_local_vllm_nemotron_8b() -> None:
@@ -129,6 +131,7 @@ def test_build_agentic_config_defaults_to_local_vllm_nemotron_8b() -> None:
     assert cfg.llm_backend == "in_process"
     assert cfg.local_llm_backend == "vllm"
     assert cfg.llm_model == "nemotron-8b"
+    assert cfg.max_tokens is None
 
 
 def test_run_beir_queries_routes_to_agentic(tmp_path) -> None:
