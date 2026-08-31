@@ -1840,6 +1840,14 @@ async def answer(req: ServiceAnswerRequest, request: Request) -> Response | Answ
 @router.post(
     "/query",
     summary="Search ingested documents by semantic similarity, hybrid, agentic, or reranked retrieval",
+    responses={
+        200: {
+            "description": "Query result, optionally streamed as live agentic progress.",
+            "content": {
+                "text/event-stream": {"schema": {"type": "string"}},
+            },
+        }
+    },
 )
 async def query(request: Request) -> Response:
     """Run the public query API through VectorDB and optional reranking.
@@ -1906,18 +1914,80 @@ async def query(request: Request) -> Response:
 
     vectordb_url = config.vectordb.vectordb_url.rstrip("/")
     timeout = config.agentic.request_timeout_s if agentic else 60.0
-    try:
-        from nemo_retriever.service.auth import authorized_scope, internal_auth_headers
 
+    from nemo_retriever.service.auth import authorized_scope, internal_auth_headers
+
+    forwarded_headers = {
+        "Content-Type": "application/json",
+        "X-NRL-Scope": authorized_scope(request),
+        **internal_auth_headers(config.vectordb.internal_api_token),
+    }
+    stream_agentic = agentic and (request.headers.get("accept") or "").strip().lower() == "text/event-stream"
+    if stream_agentic:
+        forwarded_headers["Accept"] = "text/event-stream"
+        client = httpx.AsyncClient(timeout=timeout)
+        try:
+            upstream_request = client.build_request(
+                "POST",
+                f"{vectordb_url}/v1/query",
+                content=query_body,
+                headers=forwarded_headers,
+            )
+            resp = await client.send(upstream_request, stream=True)
+        except httpx.HTTPError as exc:
+            await client.aclose()
+            logger.exception("Failed to proxy query to vectordb at %s", vectordb_url)
+            raise HTTPException(status_code=502, detail="VectorDB service is unavailable.") from exc
+        except BaseException:
+            await client.aclose()
+            raise
+
+        content_type = resp.headers.get("content-type", "")
+        response_media_type = content_type.partition(";")[0].strip().lower()
+        if resp.status_code < 400 and response_media_type == "text/event-stream":
+
+            async def stream_upstream():
+                try:
+                    async for chunk in resp.aiter_raw():
+                        yield chunk
+                finally:
+                    try:
+                        await resp.aclose()
+                    finally:
+                        await client.aclose()
+
+            return StreamingResponse(
+                stream_upstream(),
+                status_code=resp.status_code,
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": resp.headers.get("cache-control", "no-cache"),
+                    "X-Accel-Buffering": resp.headers.get("x-accel-buffering", "no"),
+                },
+            )
+
+        try:
+            content = await resp.aread()
+        except httpx.HTTPError as exc:
+            logger.exception("Failed to read query response from vectordb at %s", vectordb_url)
+            raise HTTPException(status_code=502, detail="VectorDB service is unavailable.") from exc
+        finally:
+            try:
+                await resp.aclose()
+            finally:
+                await client.aclose()
+        return Response(
+            content=content,
+            status_code=resp.status_code,
+            media_type=response_media_type or "application/json",
+        )
+
+    try:
         async with httpx.AsyncClient(timeout=timeout) as client:
             resp = await client.post(
                 f"{vectordb_url}/v1/query",
                 content=query_body,
-                headers={
-                    "Content-Type": "application/json",
-                    "X-NRL-Scope": authorized_scope(request),
-                    **internal_auth_headers(config.vectordb.internal_api_token),
-                },
+                headers=forwarded_headers,
             )
     except httpx.HTTPError as exc:
         logger.exception("Failed to proxy query to vectordb at %s", vectordb_url)

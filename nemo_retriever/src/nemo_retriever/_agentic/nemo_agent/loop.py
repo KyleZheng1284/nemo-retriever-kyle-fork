@@ -43,6 +43,7 @@ from .llm import (
     bind_stage,
     get_query_id,
 )
+from .progress import get_progress_session
 from .results import (
     ERROR_BAD_FINISH_REASON,
     ERROR_CONTENT_POLICY,
@@ -248,8 +249,39 @@ class _BaseAgentLoop:
     async def _step(self, state: _RunState) -> None:
         """One LLM call: append the assistant message or record a terminal error."""
         await state.pacer.await_propagation()
-        with bind_stage(state.stage):
-            result = await self.llm.acompletion(messages=state.message_history, tools=state.tool_specs)
+        progress_session = get_progress_session()
+        if progress_session is not None:
+            graph_query_id = get_query_id()
+            if graph_query_id is None:
+                progress_session = None
+            else:
+                progress_stage = "react" if state.stage == "main_agent" else "selection"
+                progress_step = progress_session.start_llm(graph_query_id, progress_stage)
+        try:
+            with bind_stage(state.stage):
+                result = await self.llm.acompletion(messages=state.message_history, tools=state.tool_specs)
+        except Exception as exc:
+            if progress_session is not None:
+                progress_session.finish_llm(
+                    graph_query_id,
+                    stage=progress_stage,
+                    step=progress_step,
+                    outcome="limit" if isinstance(exc, ContextLimitError) else "error",
+                )
+            raise
+        if progress_session is not None:
+            if result.finish_reason in ("stop", "tool_calls"):
+                outcome = "success"
+            elif result.finish_reason == "length":
+                outcome = "limit"
+            else:
+                outcome = "error"
+            progress_session.finish_llm(
+                graph_query_id,
+                stage=progress_stage,
+                step=progress_step,
+                outcome=outcome,
+            )
         state.pacer.mark()
         step_idx = state.steps
         state.steps += 1

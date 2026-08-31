@@ -21,7 +21,8 @@ import pandas as pd
 from nemo_retriever._agentic.nemo_agent import SelectionAgent, SelectionAgentConfig
 from nemo_retriever._agentic.nemo_agent.atif import persist_atif_trajectory
 from nemo_retriever._agentic.nemo_agent.llm import create_llm, create_llm_config
-from nemo_retriever._agentic.nemo_agent.results import AgentRunResult
+from nemo_retriever._agentic.nemo_agent.progress import get_progress_session
+from nemo_retriever._agentic.nemo_agent.results import ERROR_CONTEXT_LIMIT, ERROR_MAX_STEPS, AgentRunResult
 from nemo_retriever.operators.abstract_operator import AbstractOperator
 from nemo_retriever.operators.cpu_operator import CPUOperator
 
@@ -368,6 +369,9 @@ class SelectionAgentOperator(AbstractOperator, CPUOperator):
         query_id: str,
     ) -> Optional[AgentRunResult]:
         """Run the selection agent, returning None on an unexpected failure."""
+        progress_session = get_progress_session()
+        if progress_session is not None:
+            progress_session.start_selection(query_id)
         try:
             result = self._ensure_agent().select_sync(
                 query_text,
@@ -377,7 +381,18 @@ class SelectionAgentOperator(AbstractOperator, CPUOperator):
                 raw_log_dir=None,
             )
             persist_atif_trajectory(result.atif_trace)
-            return result
         except Exception as exc:  # production: fall back to RRF rather than crash
+            if progress_session is not None:
+                progress_session.finish_selection(query_id, selected=0, outcome="error")
             logger.warning("SelectionAgentOperator: selection failed for query %r: %s", query_id, exc, exc_info=True)
             return None
+
+        if progress_session is not None:
+            selected = min(len(result.final_doc_ids), int(self._top_k)) if result.succeeded else 0
+            if result.error is not None and result.error.category in {ERROR_CONTEXT_LIMIT, ERROR_MAX_STEPS}:
+                outcome = "limit"
+            else:
+                outcome = "success" if result.succeeded else "error"
+            progress_session.finish_selection(query_id, selected=selected, outcome=outcome)
+
+        return result

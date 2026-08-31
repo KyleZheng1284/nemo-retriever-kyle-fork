@@ -191,6 +191,351 @@ def test_agentic_retriever_isolates_usage_for_concurrent_queries():
 
 
 @patch("nemo_retriever.query.agentic.Retriever", FakeRetriever)
+def test_agentic_progress_events_are_sanitized_paired_and_summarized():
+    from nemo_retriever.query.agentic import AgenticRetrievalConfig, AgenticRetriever
+
+    usage = {"prompt_tokens": 11, "completion_tokens": 4, "total_tokens": 15}
+    response = _make_tool_call_response(
+        "final_results",
+        {
+            "doc_ids": ["doc_1"] + [f"extra_{i}" for i in range(9)],
+            "message": "PRIVATE_REASONING",
+            "search_successful": "true",
+        },
+        usage=usage,
+    )
+    events = []
+    cfg = AgenticRetrievalConfig(llm_model="nemotron-8b", api_key="PRIVATE_API_KEY")
+    with (
+        patch("nemo_retriever.query.agentic._build_agent_chat_completion_fn", return_value=lambda **_: response),
+        patch("nemo_retriever.operators.graph_ops.react_agent_operator.persist_atif_trajectory"),
+    ):
+        result = AgenticRetriever(cfg, match_mode="pdf_page").retrieve_with_usage(
+            ["customer-q"],
+            ["PRIVATE_QUERY"],
+            on_event=events.append,
+        )
+
+    assert result.usage == {"customer-q": {"main_agent": usage}}
+    assert [event["sequence"] for event in events] == list(range(1, len(events) + 1))
+    assert len({event["run_id"] for event in events}) == 1
+    assert {event["query_id"] for event in events} == {"customer-q"}
+    json.dumps(events)
+    expected_keys = {
+        "schema_version",
+        "run_id",
+        "sequence",
+        "query_id",
+        "query_index",
+        "operation",
+        "phase",
+        "message",
+        "attributes",
+    }
+    assert all(set(event) == expected_keys for event in events)
+    assert {event["query_index"] for event in events} == {0}
+    assert all(
+        value is None or isinstance(value, (str, int, float, bool))
+        for event in events
+        for value in event["attributes"].values()
+    )
+
+    root_events = [event for event in events if event["operation"] == "query"]
+    assert [event["phase"] for event in root_events] == ["start", "end"]
+    assert root_events[1]["attributes"] == {
+        "retrieval_rounds": 1,
+        "result_source": "final_results",
+        "selected": 10,
+        "outcome": "success",
+    }
+    assert root_events[1]["message"] == (
+        "The agent completed the initial retrieval. The ReAct agent supplied 10 results."
+    )
+
+    child_events = [event for event in events if event["operation"] != "query"]
+    assert {event["operation"] for event in child_events} == {"retrieval", "llm"}
+    for operation in {"retrieval", "llm"}:
+        phases = [event["phase"] for event in child_events if event["operation"] == operation]
+        assert phases == ["start", "end"]
+
+    wire = json.dumps(events, sort_keys=True)
+    for forbidden in (
+        "PRIVATE_QUERY",
+        "PRIVATE_REASONING",
+        "matching document",
+        "doc_1",
+        "PRIVATE_API_KEY",
+        "atif_trace",
+        "trajectory",
+        "retrieval_log",
+    ):
+        assert forbidden not in wire
+
+
+@patch("nemo_retriever.query.agentic.Retriever", FakeRetriever)
+def test_agentic_progress_does_not_change_atif_trace():
+    from uuid import UUID
+
+    from nemo_retriever.query.agentic import AgenticRetrievalConfig, AgenticRetriever
+
+    usage = {"prompt_tokens": 11, "completion_tokens": 4, "total_tokens": 15}
+    response = _make_tool_call_response(
+        "final_results",
+        {"doc_ids": ["doc_1"] + [f"extra_{i}" for i in range(9)], "message": "done", "search_successful": "true"},
+        usage=usage,
+    )
+    traces = []
+    events = []
+    cfg = AgenticRetrievalConfig(llm_model="nemotron-8b")
+    fixed_uuid = UUID(int=1)
+
+    def capture_atif(trace):
+        assert trace is not None
+        traces.append(json.loads(json.dumps(trace)))
+
+    with (
+        patch("nemo_retriever.query.agentic._build_agent_chat_completion_fn", return_value=lambda **_: response),
+        patch(
+            "nemo_retriever.operators.graph_ops.react_agent_operator.persist_atif_trajectory",
+            side_effect=capture_atif,
+        ),
+        patch("nemo_retriever._agentic.nemo_agent.atif.utc_timestamp", return_value="2026-01-01T00:00:00.000Z"),
+        patch("nemo_retriever._agentic.nemo_agent.atif.uuid", MagicMock(uuid4=lambda: fixed_uuid)),
+    ):
+        with (
+            patch("nemo_retriever.query.agentic._AgenticProgressSession", side_effect=AssertionError("session")),
+            patch("nemo_retriever._agentic.nemo_agent.progress.uuid") as progress_uuid,
+            patch(
+                "nemo_retriever._agentic.nemo_agent.progress._query_summary",
+                side_effect=AssertionError("summary"),
+            ),
+            patch(
+                "nemo_retriever.operators.graph_ops.react_agent_operator.copy_context",
+                side_effect=AssertionError("context copy"),
+            ),
+        ):
+            progress_uuid.uuid4.side_effect = AssertionError("uuid")
+            without_progress = AgenticRetriever(cfg, match_mode="pdf_page").retrieve_with_usage(
+                ["customer-q"], ["find doc"]
+            )
+        assert len(traces) == 1
+        with_progress = AgenticRetriever(cfg, match_mode="pdf_page").retrieve_with_usage(
+            ["customer-q"], ["find doc"], on_event=events.append
+        )
+
+    assert events
+    assert len(traces) == 2
+    assert traces[0] == traces[1]
+    assert without_progress.usage == with_progress.usage
+    pd.testing.assert_frame_equal(without_progress.documents, with_progress.documents)
+
+
+@patch("nemo_retriever.query.agentic.Retriever", FakeRetriever)
+def test_agentic_progress_sink_failure_is_fail_open_and_logged_once(caplog):
+    from nemo_retriever.query.agentic import AgenticRetrievalConfig, AgenticRetriever
+
+    response = _make_tool_call_response(
+        "final_results",
+        {
+            "doc_ids": ["doc_1"] + [f"extra_{i}" for i in range(9)],
+            "message": "done",
+            "search_successful": "true",
+        },
+    )
+    callback_calls = []
+
+    def failing_sink(event):
+        callback_calls.append(event)
+        raise RuntimeError("sink-owned failure")
+
+    cfg = AgenticRetrievalConfig(llm_model="nemotron-8b")
+    with (
+        caplog.at_level(
+            logging.WARNING,
+            logger="nemo_retriever._agentic.nemo_agent.progress",
+        ),
+        patch("nemo_retriever.query.agentic._build_agent_chat_completion_fn", return_value=lambda **_: response),
+        patch("nemo_retriever.operators.graph_ops.react_agent_operator.persist_atif_trajectory"),
+    ):
+        result = AgenticRetriever(cfg, match_mode="pdf_page").retrieve_with_usage(
+            ["customer-q"],
+            ["find doc"],
+            on_event=failing_sink,
+        )
+
+    assert len(result.documents) == 10
+    assert len(callback_calls) == 1
+    warnings = [record for record in caplog.records if "progress callback failed" in record.message]
+    assert len(warnings) == 1
+    assert "sink-owned failure" not in warnings[0].message
+
+
+@patch("nemo_retriever.query.agentic.Retriever", FakeRetriever)
+def test_agentic_progress_outer_failure_closes_root_with_sanitized_error():
+    from nemo_retriever.query.agentic import AgenticRetrievalConfig, AgenticRetriever
+
+    events = []
+    cfg = AgenticRetrievalConfig(llm_model="nemotron-8b")
+    with (
+        patch("nemo_retriever.query.agentic._build_agent_chat_completion_fn", return_value=lambda **_: {}),
+        patch.object(FakeRetriever, "queries", side_effect=RuntimeError("PRIVATE_EXCEPTION_TEXT")),
+        pytest.raises(RuntimeError, match="PRIVATE_EXCEPTION_TEXT"),
+    ):
+        AgenticRetriever(cfg, match_mode="pdf_page").retrieve_with_usage(
+            ["customer-q"],
+            ["PRIVATE_QUERY"],
+            on_event=events.append,
+        )
+
+    assert [(event["operation"], event["phase"]) for event in events] == [
+        ("query", "start"),
+        ("query", "end"),
+    ]
+    query_end = events[-1]
+    assert query_end["message"] == "Agentic retrieval failed."
+    assert query_end["attributes"] == {
+        "retrieval_rounds": 0,
+        "result_source": "",
+        "selected": 0,
+        "outcome": "error",
+    }
+    assert "PRIVATE_EXCEPTION_TEXT" not in json.dumps(events)
+
+
+@patch("nemo_retriever.query.agentic.Retriever", FakeRetriever)
+def test_agentic_progress_emits_one_retrieval_end_when_message_conversion_fails():
+    from nemo_retriever.query.agentic import AgenticRetrievalConfig, AgenticRetriever
+
+    events = []
+    cfg = AgenticRetrievalConfig(llm_model="nemotron-8b", top_k=1)
+    with (
+        patch("nemo_retriever.query.agentic._build_agent_chat_completion_fn", return_value=lambda **_: {}),
+        patch(
+            "nemo_retriever._agentic.nemo_agent.agent.retrieve_output_to_msg_content",
+            side_effect=TypeError("PRIVATE_CONVERSION_FAILURE"),
+        ),
+        patch("nemo_retriever.operators.graph_ops.react_agent_operator.persist_atif_trajectory"),
+        pytest.raises(RuntimeError, match="PRIVATE_CONVERSION_FAILURE"),
+    ):
+        AgenticRetriever(cfg, match_mode="pdf_page").retrieve_with_usage(
+            ["customer-q"],
+            ["find doc"],
+            on_event=events.append,
+        )
+
+    retrieval_ends = [event for event in events if event["operation"] == "retrieval" and event["phase"] == "end"]
+    assert [event["attributes"]["outcome"] for event in retrieval_ends] == ["error"]
+    assert "PRIVATE_CONVERSION_FAILURE" not in json.dumps(events)
+
+
+@patch("nemo_retriever.query.agentic.Retriever", FakeRetriever)
+def test_agentic_progress_concurrent_duplicate_ids_keep_distinct_roots():
+    from nemo_retriever.query.agentic import AgenticRetrievalConfig, AgenticRetriever
+
+    response = _make_tool_call_response(
+        "final_results",
+        {
+            "doc_ids": ["doc_1"] + [f"extra_{i}" for i in range(9)],
+            "message": "done",
+            "search_successful": "true",
+        },
+    )
+    events = []
+    cfg = AgenticRetrievalConfig(llm_model="nemotron-8b", num_concurrent=2)
+    with (
+        patch("nemo_retriever.query.agentic._build_agent_chat_completion_fn", return_value=lambda **_: response),
+        patch("nemo_retriever.operators.graph_ops.react_agent_operator.persist_atif_trajectory"),
+    ):
+        AgenticRetriever(cfg, match_mode="pdf_page").retrieve_with_usage(
+            ["duplicate", "duplicate"],
+            ["find a", "find b"],
+            on_event=events.append,
+        )
+
+    assert [event["sequence"] for event in events] == list(range(1, len(events) + 1))
+    assert {event["query_index"] for event in events} == {0, 1}
+    assert {event["query_id"] for event in events} == {"duplicate"}
+    for query_index in (0, 1):
+        query_phases = [
+            event["phase"] for event in events if event["query_index"] == query_index and event["operation"] == "query"
+        ]
+
+        assert query_phases == ["start", "end"]
+
+
+@patch("nemo_retriever.query.agentic.Retriever", FakeRetriever)
+def test_agentic_progress_reports_real_selection_context_shrink_retry():
+    from nemo_retriever._agentic.nemo_agent.llm import ContextLimitError
+    from nemo_retriever.query.agentic import AgenticRetrievalConfig, AgenticRetriever
+
+    react_response = {
+        "choices": [{"message": {"content": "PRIVATE_PARTIAL_RESPONSE"}, "finish_reason": "length"}],
+        "usage": {"prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 3},
+    }
+    selection_response = _make_tool_call_response(
+        "log_selected_documents",
+        {"doc_ids": ["doc_1"], "message": "PRIVATE_SELECTION_REASON"},
+    )
+    selection_calls = 0
+
+    def chat_fn(**kwargs):
+        nonlocal selection_calls
+        tool_names = {(tool.get("function") or {}).get("name") for tool in (kwargs.get("tools") or [])}
+        if "log_selected_documents" in tool_names:
+            selection_calls += 1
+            if selection_calls == 1:
+                raise ContextLimitError("PRIVATE_CONTEXT_LIMIT")
+            return selection_response
+        return react_response
+
+    events = []
+    cfg = AgenticRetrievalConfig(llm_model="nemotron-8b", top_k=1)
+    with (
+        patch("nemo_retriever.query.agentic._build_agent_chat_completion_fn", return_value=chat_fn),
+        patch("nemo_retriever.operators.graph_ops.react_agent_operator.persist_atif_trajectory"),
+        patch("nemo_retriever.operators.graph_ops.selection_agent_operator.persist_atif_trajectory"),
+    ):
+        result = AgenticRetriever(cfg, match_mode="pdf_page").retrieve_with_usage(
+            ["customer-q"],
+            ["find doc"],
+            on_event=events.append,
+        )
+
+    selection_llm_ends = [
+        event
+        for event in events
+        if event["operation"] == "llm" and event["phase"] == "end" and event["attributes"]["stage"] == "selection"
+    ]
+    assert selection_calls == 2
+    assert [(event["attributes"]["step"], event["attributes"]["outcome"]) for event in selection_llm_ends] == [
+        (1, "limit"),
+        (2, "success"),
+    ]
+    assert result.documents["result_source"].tolist() == ["selection_agent"]
+    react_llm_end = next(
+        event
+        for event in events
+        if event["operation"] == "llm" and event["phase"] == "end" and event["attributes"]["stage"] == "react"
+    )
+    assert react_llm_end["attributes"]["outcome"] == "limit"
+    selection_events = [event for event in events if event["operation"] == "selection"]
+    assert [event["phase"] for event in selection_events] == ["start", "end"]
+    assert selection_events[-1]["attributes"] == {"selected": 1, "outcome": "success"}
+    query_end = next(event for event in events if event["operation"] == "query" and event["phase"] == "end")
+    assert query_end["attributes"]["result_source"] == "selection_agent"
+    assert query_end["message"] == ("The agent completed the initial retrieval. The selection pass supplied 1 result.")
+    for event in events:
+        assert set(event["attributes"]).isdisjoint({"model", "finish_reason", "input_tokens", "output_tokens"})
+    wire = json.dumps(events)
+    for forbidden in (
+        "PRIVATE_CONTEXT_LIMIT",
+        "PRIVATE_PARTIAL_RESPONSE",
+        "PRIVATE_SELECTION_REASON",
+    ):
+        assert forbidden not in wire
+
+
+@patch("nemo_retriever.query.agentic.Retriever", FakeRetriever)
 def test_agentic_retriever_rehydrates_only_retrieved_documents():
     from nemo_retriever.query.agentic import AgenticRetrievalConfig, AgenticRetriever
 
@@ -547,9 +892,10 @@ def test_run_agentic_beir_evaluation_loads_queries_and_qrels():
     )
     cfg = AgenticRetrievalConfig(llm_model="nemotron-8b")
 
-    with patch("nemo_retriever.query.agentic._build_agent_chat_completion_fn", return_value=chat_fn), patch(
-        "nemo_retriever.query.agentic.load_beir_dataset", return_value=beir_dataset
-    ) as mock_loader:
+    with (
+        patch("nemo_retriever.query.agentic._build_agent_chat_completion_fn", return_value=chat_fn),
+        patch("nemo_retriever.query.agentic.load_beir_dataset", return_value=beir_dataset) as mock_loader,
+    ):
         df_query, result, qrels, run, metrics = run_agentic_beir_evaluation(
             loader="vidore_hf",
             dataset_name="vidore_v3_finance_en",

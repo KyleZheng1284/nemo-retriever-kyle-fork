@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from nemo_retriever.query.agentic import AgenticRetrievalConfig, AgenticRetriever
+    from nemo_retriever.query.agentic import AgenticProgressSink, AgenticRetrievalConfig, AgenticRetriever
 
 from nemo_retriever.common.params import build_embed_option_kwargs
 from nemo_retriever.common.remote_auth import resolve_remote_api_key
@@ -258,13 +258,17 @@ def agentic_query_documents(request: QueryRequest) -> list[dict[str, Any]]:
         retriever.unload()
 
 
-def agentic_query_documents_with_metadata(request: QueryRequest) -> AgenticQueryDocumentsResult:
-    """Run one agentic query and return ranked hits plus exact LLM usage."""
+def agentic_query_documents_with_metadata(
+    request: QueryRequest,
+    *,
+    on_event: AgenticProgressSink | None = None,
+) -> AgenticQueryDocumentsResult:
+    """Run one agentic query with exact usage and optional sanitized progress."""
     from nemo_retriever._agentic.nemo_agent.llm.usage import normalize_usage_breakdown
 
     retriever = build_agentic_retriever(request)
     try:
-        result = retriever.retrieve_with_usage(["0"], [str(request.query)])
+        result = retriever.retrieve_with_usage(["0"], [str(request.query)], on_event=on_event)
         return AgenticQueryDocumentsResult(
             hits=_agentic_rows_to_hits(result.documents, top_k=request.retrieval.top_k),
             usage=normalize_usage_breakdown(result.usage.get("0")),

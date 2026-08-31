@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from contextvars import ContextVar
+from contextvars import ContextVar, copy_context
 from typing import Any, Callable, Dict, List, Optional
 
 import pandas as pd
@@ -31,6 +31,7 @@ from nemo_retriever._agentic.nemo_agent import (
 )
 from nemo_retriever._agentic.nemo_agent.atif import persist_atif_trajectory
 from nemo_retriever._agentic.nemo_agent.llm import create_llm, create_llm_config
+from nemo_retriever._agentic.nemo_agent.progress import get_progress_session
 from nemo_retriever.operators.abstract_operator import AbstractOperator
 from nemo_retriever.operators.cpu_operator import CPUOperator
 
@@ -332,7 +333,13 @@ class ReActAgentOperator(AbstractOperator, CPUOperator):
             # deterministic regardless of thread completion order.
             results_by_qid: Dict[str, List[Dict[str, Any]]] = {}
             with ThreadPoolExecutor(max_workers=min(self._num_concurrent, len(query_rows))) as executor:
-                futures = {executor.submit(self._run_single_query, qid, qtxt): qid for qid, qtxt in query_rows}
+                if get_progress_session() is None:
+                    futures = {executor.submit(self._run_single_query, qid, qtxt): qid for qid, qtxt in query_rows}
+                else:
+                    futures = {
+                        executor.submit(copy_context().run, self._run_single_query, qid, qtxt): qid
+                        for qid, qtxt in query_rows
+                    }
                 for future in as_completed(futures):
                     qid = futures[future]
                     try:

@@ -19,6 +19,12 @@ from typing import Any, Optional, Sequence
 
 import pandas as pd
 
+from nemo_retriever._agentic.nemo_agent.progress import AgenticProgressEvent as AgenticProgressEvent  # noqa: F401
+from nemo_retriever._agentic.nemo_agent.progress import (
+    AgenticProgressSink as AgenticProgressSink,
+    _AgenticProgressSession,
+    bind_progress_session,
+)
 from nemo_retriever.common.params import build_embed_option_kwargs
 from nemo_retriever.operators.abstract_operator import AbstractOperator
 from nemo_retriever.models import VL_RERANK_MODEL
@@ -473,8 +479,10 @@ class AgenticRetriever:
         self,
         query_ids: Sequence[str],
         query_texts: Sequence[str],
+        *,
+        on_event: AgenticProgressSink | None = None,
     ) -> AgenticRetrieveResult:
-        """Return ranked documents and exact per-query agent LLM usage.
+        """Return ranked documents, exact usage, and optional sanitized progress.
 
         Parameters
         ----------
@@ -482,6 +490,9 @@ class AgenticRetriever:
             Caller-owned IDs used as keys in the returned usage mapping.
         query_texts:
             Query strings aligned positionally with ``query_ids``.
+        on_event:
+            Optional synchronous sink for privacy-safe lifecycle events. The
+            sink should enqueue immediately and must not block agent workers.
 
         Returns
         -------
@@ -556,33 +567,66 @@ class AgenticRetriever:
             embed_kwargs={"text_column": "query_text"},
         )
         usage_by_query: dict[str, dict[str, Any]] = {}
+        progress_session = _AgenticProgressSession(on_event, caller_query_ids) if on_event is not None else None
+        if progress_session is not None and not progress_session.enabled:
+            progress_session = None
         try:
-            raw_hits = graph_retriever.queries(
-                [str(query_text) for query_text in query_texts],
-                top_k=target_top_k,
-            )
-        finally:
-            # Retriever.queries assigns positional graph query IDs ("0", "1",
-            # ...). Pop both operator-owned backends after all query workers
-            # finish, then restore the caller's IDs.
-            for position, caller_query_id in enumerate(caller_query_ids):
-                # Each backend has already summed repeated calls within its
-                # stages. Operator stage names are disjoint
-                # (main_agent vs top{K}_agent), so joining the maps is enough.
-                breakdown = {
-                    **react_operator.pop_query_usage(str(position)),
-                    **selection_operator.pop_query_usage(str(position)),
-                }
-                if breakdown:
-                    usage_by_query[caller_query_id] = breakdown
+            try:
+                if progress_session is None:
+                    raw_hits = graph_retriever.queries(
+                        [str(query_text) for query_text in query_texts],
+                        top_k=target_top_k,
+                    )
+                else:
+                    with bind_progress_session(progress_session):
+                        raw_hits = graph_retriever.queries(
+                            [str(query_text) for query_text in query_texts],
+                            top_k=target_top_k,
+                        )
+            finally:
+                # Retriever.queries assigns positional graph query IDs ("0", "1",
+                # ...). Pop both operator-owned backends after all query workers
+                # finish, then restore the caller's IDs.
+                for position, caller_query_id in enumerate(caller_query_ids):
+                    # Each backend has already summed repeated calls within its
+                    # stages. Operator stage names are disjoint
+                    # (main_agent vs top{K}_agent), so joining the maps is enough.
+                    breakdown = {
+                        **react_operator.pop_query_usage(str(position)),
+                        **selection_operator.pop_query_usage(str(position)),
+                    }
+                    if breakdown:
+                        usage_by_query[caller_query_id] = breakdown
 
-        result = _raw_hits_to_agentic_result(caller_query_ids, raw_hits)
-        with self._hit_cache_lock:
-            hit_cache = dict(self._hit_cache)
-        return AgenticRetrieveResult(
-            documents=_rehydrate_selected_hits(result, hit_cache),
-            usage=usage_by_query,
-        )
+            result = _raw_hits_to_agentic_result(caller_query_ids, raw_hits)
+            with self._hit_cache_lock:
+                hit_cache = dict(self._hit_cache)
+            retrieve_result = AgenticRetrieveResult(
+                documents=_rehydrate_selected_hits(result, hit_cache),
+                usage=usage_by_query,
+            )
+            if progress_session is not None:
+                for position in range(len(caller_query_ids)):
+                    query_hits = raw_hits[position] if position < len(raw_hits) else []
+                    first_hit = query_hits[0] if query_hits else {}
+                    result_source = str(first_hit.get("result_source", "")) if isinstance(first_hit, dict) else ""
+                    progress_session.finish_query(
+                        str(position),
+                        result_source=result_source,
+                        selected=len(query_hits),
+                        outcome="success",
+                    )
+            return retrieve_result
+        except Exception:
+            if progress_session is not None:
+                for position in range(len(caller_query_ids)):
+                    progress_session.finish_query(
+                        str(position),
+                        result_source="",
+                        selected=0,
+                        outcome="error",
+                    )
+            raise
 
     def _retrieve_for_agent(self, query_text: str, top_k: int, *, query_id: str = "") -> list[dict[str, Any]]:
         """Retriever callback used by ``ReActAgentOperator``.

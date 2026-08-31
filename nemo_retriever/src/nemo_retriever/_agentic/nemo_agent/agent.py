@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Set, Tuple, Union
 
 from .cache_propagation import PropagationPacer
-from .llm import BaseLLMBackend, bind_query_id
+from .llm import BaseLLMBackend, bind_query_id, get_query_id
 from .loop import (
     BaseAgentLoopConfig,
     ToolExecutionError,
@@ -28,6 +28,7 @@ from .loop import (
     _RunState,
     build_auto_continue_msg,
 )
+from .progress import get_progress_session
 from .prompts import render_system_prompt
 from .results import AgentRunResult
 from .tools import (
@@ -317,46 +318,90 @@ class Agent(_BaseAgentLoop):
         # docs new to this run (when ensure_new_docs), top_k new docs remain.
         seen = state.retrieved_docs if self.config.ensure_new_docs else set()
         fetch_k = top_k + len(seen) + len(state.exclude_docs)
-        result = await tool.acall(query, top_k=fetch_k, context=context)
-        if isinstance(result, str):
-            return [{"type": "text", "text": result}]
-
-        result = sorted(result, key=lambda d: d["score"], reverse=True)
-        output: List[Dict[str, Any]] = []
-        num_new = 0
-        call_seen: Set[str] = set()
-        for item in result:
-            if item["id"] in state.exclude_docs:
-                continue
-            if item["id"] in call_seen:
-                continue
-            call_seen.add(item["id"])
-            rec = dict(item)
-            if rec["id"] not in seen:
-                num_new += 1
-            output.append(rec)
-            if num_new >= top_k:
-                break
-
-        # Repeats keep their slot but drop their content (the LLM saw it
-        # already); must run BEFORE the ids below join retrieved_docs.
-        for rec in output:
-            if rec["id"] in state.retrieved_docs:
-                rec.pop("image", None)
-                rec.pop("text", None)
-                rec["note"] = (
-                    "This document is retrieved before. See previous retrieval results "
-                    f"for the content of this document (id: {rec['id']})."
+        progress_session = get_progress_session()
+        if progress_session is not None:
+            graph_query_id = get_query_id()
+            if graph_query_id is None:
+                progress_session = None
+            else:
+                progress_kind = "initial" if query_type == "main" else "follow_up"
+                round_number = progress_session.start_retrieval(
+                    graph_query_id,
+                    kind=progress_kind,
+                    requested=top_k,
                 )
-        for rec in output:
-            state.retrieved_docs.add(rec["id"])
 
-        state.retrieval_log.append(
-            {
-                "input": {"query": query, "top_k": top_k},
-                "tool_name": tool.name,
-                "query_type": query_type,
-                "output": output,
-            }
-        )
-        return retrieve_output_to_msg_content(output)
+        try:
+            result = await tool.acall(query, top_k=fetch_k, context=context)
+            if isinstance(result, str):
+                if progress_session is not None:
+                    progress_session.finish_retrieval(
+                        graph_query_id,
+                        round_number=round_number,
+                        kind=progress_kind,
+                        requested=top_k,
+                        returned=0,
+                        outcome="error",
+                    )
+                return [{"type": "text", "text": result}]
+
+            result = sorted(result, key=lambda d: d["score"], reverse=True)
+            output: List[Dict[str, Any]] = []
+            num_new = 0
+            call_seen: Set[str] = set()
+            for item in result:
+                if item["id"] in state.exclude_docs:
+                    continue
+                if item["id"] in call_seen:
+                    continue
+                call_seen.add(item["id"])
+                rec = dict(item)
+                if rec["id"] not in seen:
+                    num_new += 1
+                output.append(rec)
+                if num_new >= top_k:
+                    break
+
+            # Repeats keep their slot but drop their content (the LLM saw it
+            # already); must run BEFORE the ids below join retrieved_docs.
+            for rec in output:
+                if rec["id"] in state.retrieved_docs:
+                    rec.pop("image", None)
+                    rec.pop("text", None)
+                    rec["note"] = (
+                        "This document is retrieved before. See previous retrieval results "
+                        f"for the content of this document (id: {rec['id']})."
+                    )
+            for rec in output:
+                state.retrieved_docs.add(rec["id"])
+
+            state.retrieval_log.append(
+                {
+                    "input": {"query": query, "top_k": top_k},
+                    "tool_name": tool.name,
+                    "query_type": query_type,
+                    "output": output,
+                }
+            )
+            message_content = retrieve_output_to_msg_content(output)
+            if progress_session is not None:
+                progress_session.finish_retrieval(
+                    graph_query_id,
+                    round_number=round_number,
+                    kind=progress_kind,
+                    requested=top_k,
+                    returned=len(output),
+                    outcome="success",
+                )
+            return message_content
+        except Exception:
+            if progress_session is not None:
+                progress_session.finish_retrieval(
+                    graph_query_id,
+                    round_number=round_number,
+                    kind=progress_kind,
+                    requested=top_k,
+                    returned=0,
+                    outcome="error",
+                )
+            raise

@@ -6,7 +6,10 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from nemo_retriever.query.agentic import AgenticProgressSink
 
 from nemo_retriever.query.options import (
     QueryAgenticOptions,
@@ -18,7 +21,6 @@ from nemo_retriever.query.options import (
 from nemo_retriever.query.workflow import agentic_query_documents_with_metadata
 from nemo_retriever.service.config import AgenticConfig
 from nemo_retriever.service.query_schema import AgenticQueryResponse, QueryResult
-
 
 #: Annotations the agentic workflow layers on top of the classic hit fields.
 _AGENTIC_ANNOTATION_FIELDS = frozenset({"doc_id", "rank", "result_source"})
@@ -140,8 +142,9 @@ def run_agentic_query(
     embed_model: str,
     embed_model_provider_prefix: str | None,
     embed_api_key: str,
+    on_event: AgenticProgressSink | None = None,
 ) -> AgenticQueryResponse:
-    """Execute one agentic retrieval query and return hits plus LLM usage."""
+    """Execute one agentic retrieval query and optionally report live progress."""
     query_request = build_agentic_query_request(
         query=query,
         top_k=top_k,
@@ -153,7 +156,7 @@ def run_agentic_query(
         embed_model_provider_prefix=embed_model_provider_prefix,
         embed_api_key=embed_api_key,
     )
-    result = agentic_query_documents_with_metadata(query_request)
+    result = agentic_query_documents_with_metadata(query_request, on_event=on_event)
     return AgenticQueryResponse(
         results=[QueryResult(hits=agentic_ranked_to_hits(result.hits))],
         query_mode="agentic",

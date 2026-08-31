@@ -192,6 +192,98 @@ When service auth is enabled, send `Authorization: Bearer <token>` (`NEMO_RETRIE
 
 `top_k` cannot exceed the configured `agentic.backend_top_k` (default 20). Agentic queries are capped at 4,096 characters.
 
+## Observe live agentic progress { #observe-live-agentic-progress }
+
+Agentic progress events provide sanitized status while a query runs. You can
+consume the event contract through a Python callback or server-sent events
+(SSE). Progress is observation-only. It cannot approve, reject, cancel, or
+otherwise control an agentic run.
+
+### Use the Python callback { #use-the-python-callback }
+
+Pass a synchronous callback to the enriched `retrieve_with_usage` API. The
+callback can run on agent worker threads, so keep it nonblocking and thread-safe.
+For example, enqueue each event for another thread or process to consume. The
+following example assumes `agentic_retriever` is an existing `AgenticRetriever`
+instance and `progress_queue` is a thread-safe queue.
+
+```python
+from nemo_retriever.query.agentic import AgenticProgressEvent
+
+
+def report_progress(event: AgenticProgressEvent) -> None:
+    progress_queue.put_nowait(event)
+
+
+result = agentic_retriever.retrieve_with_usage(
+    ["request-1"],
+    ["find documents about parser behavior"],
+    on_event=report_progress,
+)
+```
+
+The callback receives start and end records for `query`, `retrieval`, `llm`,
+and `selection`. Every record contains only the following safe fields:
+
+- `schema_version`, currently `"1"`.
+- `run_id` and `sequence`, which identify and order one invocation.
+- `query_id` and zero-based `query_index`, which correlate batched work and
+  distinguish duplicate query IDs.
+- `operation`, `phase`, and `message`, which describe the current status.
+- `attributes`, which contain fixed scalar counts, outcomes, and result-source
+  metadata for the operation.
+
+Within a query, use retrieval `round` or LLM `stage` and `step` attributes to
+correlate start and end records. End records report an `outcome` of `success`,
+`error`, or `limit`. The final query message summarizes the retrieval rounds
+and which observable result path supplied the ranking. Provider usage remains
+in the final query response instead of being duplicated in progress events.
+
+If the callback raises an exception, retrieval continues and disables progress
+reporting for the rest of that invocation. Omitting `on_event` preserves the
+existing enriched Python path and does not construct progress events.
+
+### Stream progress from the query API { #stream-progress-from-the-query-api }
+
+For an agentic request, set `Accept` explicitly to `text/event-stream` to opt in
+to SSE:
+
+```bash
+curl -N -X POST http://localhost:7670/v1/query \
+  -H 'Accept: text/event-stream' \
+  -H 'Content-Type: application/json' \
+  -d '{"query": "find documents about parser behavior", "top_k": 5, "agentic": true}'
+```
+
+The stream contains the following event types:
+
+| Event | Data |
+|---|---|
+| `agentic_progress` | One `AgenticProgressEvent` JSON object. |
+| `result` | The existing successful agentic query response, including hits and provider usage when available. This event is last on success. |
+| `error` | A sanitized `{"code":"agentic_query_failed","message":"Agentic retrieval failed."}` object after streaming has started. |
+
+Preflight request errors retain their existing JSON response and HTTP status.
+Requests that omit the SSE `Accept` header retain the existing JSON behavior.
+If an SSE client disconnects, progress delivery stops, but the running agentic
+query continues to completion and releases its worker slot.
+
+### Understand the privacy and integration boundaries { #progress-privacy-boundaries }
+
+Live progress excludes original and generated query text, prompts, model
+responses, hidden reasoning, tool arguments, document identifiers, document
+content, scores, endpoints, credentials, tenant scope, and raw exception
+details. It does not read from or include Agent Trajectory Interchange Format
+(ATIF) trajectories.
+
+ATIF and live progress serve different purposes. ATIF records a detailed
+post-run trajectory in a local file. Live progress emits a compact, sanitized
+status stream for user interfaces and agent harnesses. Enabling or disabling a
+progress callback does not change ATIF persistence.
+
+NRL adds no progress-specific telemetry or Agent-to-Agent runtime dependency.
+Calling applications own translation into their native progress model.
+
 ## Query with MCP { #query-with-mcp }
 
 `retriever service start` mounts a FastMCP HTTP endpoint at `/mcp` by default. Model Context Protocol (MCP) agents can use that endpoint to call the running service for health checks, pipeline introspection, document ingestion, job status, VectorDB query, agentic retrieval, and answer generation. If service auth is enabled, the MCP endpoint uses the same bearer-token middleware as the REST API.

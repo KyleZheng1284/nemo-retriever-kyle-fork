@@ -14,18 +14,22 @@ from __future__ import annotations
 import argparse
 import asyncio
 import hmac
+import json
 import logging
 import os
 import threading
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, AsyncIterator, Literal, Union, cast
+from typing import TYPE_CHECKING, Any, AsyncIterator, Literal, Union, cast
 
 import uvicorn
 from fastapi import FastAPI, Header, HTTPException, Query, Request, Response
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
+
+if TYPE_CHECKING:
+    from nemo_retriever.query.agentic import AgenticProgressEvent, AgenticProgressSink
 
 from nemo_retriever.common.remote_auth import resolve_remote_api_key
 from nemo_retriever.common.schemas.collections import (
@@ -84,6 +88,7 @@ def _validate_service_index_mode(index_mode: str) -> ServiceIndexMode:
 
 MAX_CONCURRENT_QUERIES = 4
 MAX_CONCURRENT_AGENTIC_QUERIES = 100
+_AGENTIC_SSE_KEEPALIVE_TIMEOUT_S = 30.0
 
 
 class WriteRequest(BaseModel):
@@ -692,15 +697,25 @@ def create_vectordb_app(
         "/v1/query",
         response_model=Union[AgenticQueryResponse, QueryResponse, EvidenceQueryResponse],
         tags=["query"],
+        responses={
+            200: {
+                "description": "Query result, optionally streamed as live agentic progress.",
+                "content": {
+                    "text/event-stream": {"schema": {"type": "string"}},
+                },
+            }
+        },
     )
     async def query(
+        request: Request,
         req: QueryRequest,
         x_nrl_scope: str | None = Header(None),
-    ) -> AgenticQueryResponse | QueryResponse | EvidenceQueryResponse:
+        accept: str | None = Header(None),
+    ) -> Response | AgenticQueryResponse | QueryResponse | EvidenceQueryResponse:
         current = require_state()
         if req.agentic:
-            if req.collection_name is not None:
-                raise UnsupportedVDBOperation("agentic collection retrieval")
+            if (accept or "").strip().lower() == "text/event-stream":
+                return await _stream_agentic_query(request, req)
             return await _run_agentic_query(req)
 
         if current.embed_mode == "none":
@@ -760,9 +775,15 @@ def create_vectordb_app(
             )
         return QueryResponse(results=[QueryResult(hits=hits) for hits in hits_per_query])
 
-    async def _run_agentic_query(req: QueryRequest) -> AgenticQueryResponse:
-        """Run the blocking agentic workflow without consuming plain-query workers."""
+    def _submit_agentic_query(
+        req: QueryRequest,
+        *,
+        on_event: AgenticProgressSink | None = None,
+    ) -> Future[AgenticQueryResponse]:
+        """Validate, admit, and submit one non-cancellable agentic query."""
         current = require_state()
+        if req.collection_name is not None:
+            raise UnsupportedVDBOperation("agentic collection retrieval")
         if not agentic_config.enabled:
             raise HTTPException(
                 status_code=400,
@@ -818,16 +839,95 @@ def create_vectordb_app(
                 embed_model=current.embed_model,
                 embed_model_provider_prefix=current.embed_model_provider_prefix,
                 embed_api_key=current.embed_api_key,
+                on_event=on_event,
             )
         except RuntimeError as exc:
             slots.release()
             raise HTTPException(503, "VectorDB is shutting down") from exc
 
         future.add_done_callback(lambda _future: slots.release())
+        return future
+
+    async def _run_agentic_query(req: QueryRequest) -> AgenticQueryResponse:
+        """Await the shared agentic worker submission for the JSON response path."""
+        future = _submit_agentic_query(req)
         try:
             return await asyncio.wrap_future(future)
         except ValueError as exc:
             raise VDBInvalidRequest(str(exc)) from exc
+
+    async def _stream_agentic_query(request: Request, req: QueryRequest) -> StreamingResponse:
+        """Project live agentic progress and the final response onto SSE."""
+        loop = asyncio.get_running_loop()
+        closed = threading.Event()
+        stream_queue: asyncio.Queue[tuple[str, object]] = asyncio.Queue()
+
+        def schedule(item: tuple[str, object]) -> None:
+            if closed.is_set():
+                return
+
+            def enqueue() -> None:
+                if not closed.is_set():
+                    stream_queue.put_nowait(item)
+
+            try:
+                loop.call_soon_threadsafe(enqueue)
+            except RuntimeError:
+                closed.set()
+
+        def on_event(event: AgenticProgressEvent) -> None:
+            schedule(("agentic_progress", event))
+
+        future = _submit_agentic_query(req, on_event=on_event)
+
+        def on_done(done: Future[AgenticQueryResponse]) -> None:
+            try:
+                result = done.result()
+            except Exception:
+                logger.warning("Agentic retrieval failed after SSE streaming began")
+                schedule(("error", None))
+            else:
+                schedule(("result", result))
+
+        future.add_done_callback(on_done)
+
+        async def stream() -> AsyncIterator[str]:
+            try:
+                while True:
+                    try:
+                        event_name, payload = await asyncio.wait_for(
+                            stream_queue.get(),
+                            timeout=_AGENTIC_SSE_KEEPALIVE_TIMEOUT_S,
+                        )
+                    except asyncio.TimeoutError:
+                        if await request.is_disconnected():
+                            return
+                        yield ": keepalive\n\n"
+                        continue
+
+                    if event_name == "agentic_progress":
+                        data = cast("AgenticProgressEvent", payload)
+                    elif event_name == "result":
+                        data = cast(AgenticQueryResponse, payload).model_dump(mode="json")
+                    else:
+                        data = {
+                            "code": "agentic_query_failed",
+                            "message": "Agentic retrieval failed.",
+                        }
+                    yield f"event: {event_name}\ndata: {json.dumps(data, separators=(',', ':'))}\n\n"
+                    if event_name in {"result", "error"}:
+                        return
+            finally:
+                closed.set()
+
+        return StreamingResponse(
+            stream(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+            },
+        )
 
     return app
 
