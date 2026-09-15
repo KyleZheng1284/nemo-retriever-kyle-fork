@@ -233,6 +233,24 @@ class ingestor:
 
         Captioning non-image documents automatically enables default image
         deduplication unless it is explicitly disabled through :meth:`dedup`.
+
+        Parameters
+        ----------
+        params
+            Optional image-captioning parameters.
+        **kwargs
+            Field overrides merged into ``params`` by concrete implementations.
+
+        Returns
+        -------
+        ingestor
+            The concrete ingestor instance for fluent chaining.
+
+        Raises
+        ------
+        NotImplementedError
+            Always raised by this interface implementation. Concrete run-mode
+            implementations override this method.
         """
         _ = _merge_params(params, kwargs)
         self._not_implemented("caption")

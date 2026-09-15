@@ -752,6 +752,24 @@ class GraphIngestor(ingestor):
 
         Inputs resolved to image extraction are exempt. Call :meth:`dedup`
         with both mechanisms disabled to preserve every extracted image crop.
+
+        Parameters
+        ----------
+        params
+            Optional image-captioning parameters. When neither ``params`` nor
+            keyword overrides are supplied, default parameters are used.
+        **kwargs
+            Field overrides applied after values from ``params``.
+
+        Returns
+        -------
+        GraphIngestor
+            This ingestor instance for fluent chaining.
+
+        Raises
+        ------
+        ValueError
+            If the supplied values do not form valid caption parameters.
         """
         self._caption_params = _resolve_api_key(_coerce(params, kwargs, default_factory=CaptionParams))
         self._record_stage("caption")

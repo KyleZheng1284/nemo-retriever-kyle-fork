@@ -1051,13 +1051,35 @@ class ServiceIngestor(ingestor):
         ``top_k``) — are honored. Trust-sensitive fields
         (``endpoint_url``, ``api_key``, ``model_name``) and
         local-execution fields (``device``, ``hf_cache_dir``,
-        ``tensor_parallel_size``, ``gpu_memory_utilization``) are
-        rejected on the client; the operator-configured remote endpoint
-        is the only path to a caption NIM.
+        ``tensor_parallel_size``, ``gpu_memory_utilization``) are never
+        transmitted. Prohibited keyword overrides fail fast. Non-default
+        prohibited values on a ``CaptionParams`` model also fail fast, except
+        ``api_key`` because environment auto-fill makes caller intent
+        ambiguous. Prohibited mapping values and model defaults are stripped
+        instead. The operator-configured remote endpoint is the only path to a
+        caption NIM.
 
-        We use Pydantic's ``model_fields_set`` to distinguish fields
-        the caller *explicitly* set from fields carrying their
-        ``CaptionParams`` default — only the former are rejected.
+        Parameters
+        ----------
+        params
+            Optional :class:`CaptionParams` instance or parameter mapping to
+            transmit to the service.
+        **kwargs
+            Field values used directly when ``params`` is omitted or applied
+            as overrides when ``params`` is a parameter model.
+
+        Returns
+        -------
+        ServiceIngestor
+            This ingestor instance for fluent chaining.
+
+        Raises
+        ------
+        TypeError
+            If ``params`` cannot be serialized as a parameter mapping.
+        ValueError
+            If a prohibited keyword override is supplied, or ``CaptionParams``
+            sets a non-default prohibited field other than ``api_key``.
         """
         trust_sensitive = {"endpoint_url", "api_key", "model_name"}
         local_only = {
