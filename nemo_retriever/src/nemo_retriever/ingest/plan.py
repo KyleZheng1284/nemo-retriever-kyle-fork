@@ -486,7 +486,29 @@ def build_caption_params(
 
 
 def build_dedup_params(*, enabled: bool | None, iou_threshold: float | None = None) -> DedupParams | None:
-    """Build explicit dedup parameters while preserving unspecified intent."""
+    """Build explicit dedup parameters while preserving unspecified intent.
+
+    Parameters
+    ----------
+    enabled
+        ``True`` explicitly enables deduplication, ``False`` returns the
+        all-disabled opt-out, and ``None`` leaves deduplication unspecified.
+    iou_threshold
+        Optional bounding-box intersection-over-union threshold. This override
+        is valid only when ``enabled`` is explicitly ``True``.
+
+    Returns
+    -------
+    DedupParams | None
+        Explicit enabled or disabled parameters, or ``None`` when the caller
+        did not specify a deduplication policy.
+
+    Raises
+    ------
+    ValueError
+        If ``iou_threshold`` is provided without explicitly enabling
+        deduplication or is outside the supported range.
+    """
 
     if enabled is not True:
         if iou_threshold is not None:

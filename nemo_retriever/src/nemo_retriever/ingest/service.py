@@ -330,7 +330,32 @@ def service_split_config_for_request(request: ServiceIngestRequest) -> dict[str,
 def resolve_service_dedup_for_request(
     request: ServiceIngestRequest,
 ) -> tuple[DedupParams | None, dict[str, Any] | None]:
-    """Resolve effective service dedup parameters and mixed-input scope."""
+    """Resolve effective service dedup parameters and mixed-input scope.
+
+    Parameters
+    ----------
+    request
+        Resolved service-ingest request. When deduplication is resolved
+        automatically for ``input_type="auto"``, document paths are inspected
+        to distinguish standalone images from other inputs.
+
+    Returns
+    -------
+    tuple[DedupParams | None, dict[str, Any] | None]
+        Effective deduplication parameters and an optional mixed-input scope.
+        An automatically configured mixed image/document request leaves the
+        global parameters unset and reports which input families use
+        caption-triggered deduplication.
+
+    Raises
+    ------
+    FileNotFoundError
+        If automatic resolution encounters an auto-typed literal document
+        path that does not exist.
+    IsADirectoryError
+        If automatic resolution encounters an auto-typed literal document
+        path that is a directory.
+    """
 
     if request.dedup_params is not None or request.caption_params is None:
         return request.dedup_params, None

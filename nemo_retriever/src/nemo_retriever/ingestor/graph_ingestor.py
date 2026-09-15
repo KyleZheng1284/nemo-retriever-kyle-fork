@@ -723,6 +723,25 @@ class GraphIngestor(ingestor):
 
         Configure both mechanisms as ``False`` to suppress the automatic
         deduplication otherwise enabled by captioning non-image documents.
+
+        Parameters
+        ----------
+        params
+            Optional image-deduplication parameters. When neither ``params``
+            nor keyword overrides are supplied, both default passes are
+            enabled.
+        **kwargs
+            Field overrides applied after values from ``params``.
+
+        Returns
+        -------
+        GraphIngestor
+            This ingestor instance for fluent chaining.
+
+        Raises
+        ------
+        ValueError
+            If the supplied values do not form valid deduplication parameters.
         """
         self._dedup_params = _coerce(params, kwargs, default_factory=DedupParams)
         self._record_stage("dedup")

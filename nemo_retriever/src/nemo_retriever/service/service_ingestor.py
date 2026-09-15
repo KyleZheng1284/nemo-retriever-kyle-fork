@@ -664,6 +664,27 @@ class ServiceIngestor(ingestor):
 
         Setting both mechanisms to ``False`` transmits an explicit opt-out
         that suppresses caption-triggered automatic deduplication.
+
+        Parameters
+        ----------
+        params
+            Optional :class:`DedupParams` instance or parameter mapping to
+            transmit to the service.
+        **kwargs
+            Field values used directly when ``params`` is omitted or applied
+            as overrides when ``params`` is a parameter model.
+
+        Returns
+        -------
+        ServiceIngestor
+            This ingestor instance for fluent chaining.
+
+        Raises
+        ------
+        TypeError
+            If ``params`` cannot be serialized as a parameter mapping.
+        ValueError
+            If the request attempts to set a server-owned field.
         """
         if params is not None or kwargs:
             from nemo_retriever.common.policy import _DEFAULT_ALLOWED_DEDUP_KEYS
