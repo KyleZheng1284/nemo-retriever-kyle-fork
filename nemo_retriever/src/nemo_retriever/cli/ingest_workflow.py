@@ -7,6 +7,7 @@ from __future__ import annotations
 from dataclasses import asdict
 from typing import Any
 
+from nemo_retriever.common.input_files import input_type_for_path
 from nemo_retriever.ingest.execution import execute_ingest_plan
 from nemo_retriever.ingest.plan import ResolvedIngestPlan
 from nemo_retriever.ingest.service import (
@@ -15,6 +16,7 @@ from nemo_retriever.ingest.service import (
     service_split_config_for_request,
 )
 from nemo_retriever.ingestor.manifest import format_branch_summary
+from nemo_retriever.ingestor.plans import resolve_effective_dedup_params
 
 _DRY_RUN_SECRET_FIELD_PATTERNS = ("api_key", "password", "secret", "credential", "bearer")
 
@@ -94,9 +96,35 @@ def _ingest_plan_to_dry_run_data(plan: ResolvedIngestPlan) -> dict[str, Any]:
     }
 
 
+def _service_dedup_dry_run_data(
+    request: ServiceIngestRequest,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """Return effective service dedup parameters and mixed-input scope."""
+
+    dedup_params = request.dedup_params
+    dedup_scope: dict[str, Any] | None = None
+    if dedup_params is None and request.caption_params is not None:
+        families = {input_type_for_path(document) for document in request.documents}
+        enabled_families = sorted(family for family in families if family is not None and family != "image")
+        if enabled_families and "image" in families:
+            dedup_scope = {
+                "mode": "caption_default",
+                "enabled_families": enabled_families,
+                "exempt_families": ["image"],
+            }
+        else:
+            dedup_params = resolve_effective_dedup_params(
+                None,
+                caption_enabled=True,
+                image_only=not enabled_families,
+            )
+    return _params_to_dry_run_dict(dedup_params), dedup_scope
+
+
 def service_ingest_request_to_dry_run_data(request: ServiceIngestRequest) -> dict[str, Any]:
     """Return the JSON payload printed by ``retriever ingest service --dry-run``."""
-    return {
+    dedup, dedup_scope = _service_dedup_dry_run_data(request)
+    data = {
         "dry_run": True,
         "run_mode": "service",
         "documents": list(request.documents),
@@ -104,11 +132,14 @@ def service_ingest_request_to_dry_run_data(request: ServiceIngestRequest) -> dic
         "service": _strip_secret_values(asdict(request.connection)),
         "extract": _params_to_dry_run_dict(request.extract_params),
         "split_config": _params_to_dry_run_dict(service_split_config_for_request(request)),
-        "dedup": _params_to_dry_run_dict(request.dedup_params),
+        "dedup": dedup,
         "caption": _params_to_dry_run_dict(request.caption_params),
         "embed": _params_to_dry_run_dict(request.embed_params),
         "store": _params_to_dry_run_dict(request.store_params),
     }
+    if dedup_scope is not None:
+        data["dedup_scope"] = dedup_scope
+    return data
 
 
 def run_ingest_workflow(

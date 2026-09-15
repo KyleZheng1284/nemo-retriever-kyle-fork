@@ -16,6 +16,32 @@ from nemo_retriever.common.params import TextChunkParams
 from nemo_retriever.common.params import VdbUploadParams
 
 
+def resolve_effective_dedup_params(
+    configured_params: DedupParams | None,
+    *,
+    caption_enabled: bool,
+    image_only: bool,
+) -> DedupParams | None:
+    """Resolve caption-triggered image dedup without changing configured state.
+
+    Explicit parameters are authoritative, including the all-disabled form
+    used to suppress automatic dedup. When dedup is unspecified, captioning
+    enables the default policy for document inputs but not standalone images.
+    """
+
+    if configured_params is not None:
+        return configured_params
+    if caption_enabled and not image_only:
+        return DedupParams()
+    return None
+
+
+def dedup_params_enabled(params: DedupParams | None) -> bool:
+    """Return whether at least one image-deduplication pass is enabled."""
+
+    return params is not None and (params.content_hash or params.bbox_iou)
+
+
 @dataclass(frozen=True)
 class PlannedStage:
     """A normalized transform stage ready for executor-specific translation."""

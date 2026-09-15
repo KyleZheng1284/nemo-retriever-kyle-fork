@@ -70,7 +70,7 @@ class ServiceIngestExtractOptions:
 
 @dataclass(frozen=True)
 class ServiceIngestDedupOptions:
-    enabled: bool = False
+    enabled: bool | None = None
     iou_threshold: float | None = None
 
 

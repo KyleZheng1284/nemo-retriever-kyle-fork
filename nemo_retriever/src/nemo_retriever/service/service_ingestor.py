@@ -660,7 +660,11 @@ class ServiceIngestor(ingestor):
         return self
 
     def dedup(self, params: Any = None, **kwargs: Any) -> "ServiceIngestor":
-        """Record a dedup stage with optional :class:`DedupParams` overrides."""
+        """Record a dedup stage with optional :class:`DedupParams` overrides.
+
+        Setting both mechanisms to ``False`` transmits an explicit opt-out
+        that suppresses caption-triggered automatic deduplication.
+        """
         if params is not None or kwargs:
             from nemo_retriever.common.policy import _DEFAULT_ALLOWED_DEDUP_KEYS
 
@@ -1015,6 +1019,10 @@ class ServiceIngestor(ingestor):
 
     def caption(self, params: Any = None, **kwargs: Any) -> "ServiceIngestor":
         """Record a caption stage backed by the server's remote VLM endpoint.
+
+        Captioning non-image documents automatically uses default image
+        deduplication unless :meth:`dedup` explicitly disables both
+        mechanisms. Standalone image documents remain exempt.
 
         Behavioural knobs — ``prompt``, ``system_prompt``, ``batch_size``,
         ``context_text_max_chars``, ``caption_infographics``, and generic

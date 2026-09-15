@@ -153,7 +153,11 @@ class ingestor:
         self._not_implemented("all_tasks")
 
     def dedup(self, params: DedupParams | None = None, **kwargs: Any) -> "ingestor":
-        """Record a dedup task configuration."""
+        """Record image-deduplication settings.
+
+        Passing ``content_hash=False`` and ``bbox_iou=False`` explicitly
+        suppresses any automatic deduplication associated with captioning.
+        """
         _ = _merge_params(params, kwargs)
         self._not_implemented("dedup")
 
@@ -207,7 +211,11 @@ class ingestor:
         self._not_implemented("save_intermediate_results")
 
     def caption(self, params: "CaptionParams | None" = None, **kwargs: Any) -> "ingestor":
-        """Record a caption task configuration."""
+        """Record caption settings.
+
+        Captioning non-image documents automatically enables default image
+        deduplication unless it is explicitly disabled through :meth:`dedup`.
+        """
         _ = _merge_params(params, kwargs)
         self._not_implemented("caption")
 
