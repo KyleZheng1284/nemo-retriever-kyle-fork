@@ -297,19 +297,30 @@ def test_root_ingest_service_mode_uses_service_ingest_core(tmp_path, monkeypatch
     assert "through retriever service http://retriever-service:7670" in result.output
 
 
-def test_service_split_config_expands_glob_patterns_for_auto_input(tmp_path) -> None:
+def test_service_family_resolution_expands_glob_patterns_for_auto_input(tmp_path) -> None:
     document = tmp_path / "chunked.pdf"
     document.write_bytes(b"%PDF-1.4\n")
+    image = tmp_path / "diagram.png"
+    image.write_bytes(b"png")
     request = ingest_service.ServiceIngestRequest(
-        documents=[str(tmp_path / "*.pdf")],
+        documents=[str(tmp_path / "*")],
         input_type="auto",
         enable_text_chunk=True,
         text_chunk_params=TextChunkParams(max_tokens=64, overlap_tokens=8),
+        caption_params=CaptionParams(),
     )
 
     split_config = ingest_service.service_split_config_for_request(request)
+    dedup_params, dedup_scope = ingest_service.resolve_service_dedup_for_request(request)
 
-    assert split_config == {"pdf": {"max_tokens": 64, "overlap_tokens": 8, "encoding": "utf-8"}}
+    chunk_config = {"max_tokens": 64, "overlap_tokens": 8, "encoding": "utf-8"}
+    assert split_config == {"pdf": chunk_config, "image": chunk_config}
+    assert dedup_params is None
+    assert dedup_scope == {
+        "mode": "caption_default",
+        "enabled_families": ["pdf"],
+        "exempt_families": ["image"],
+    }
 
 
 def test_root_ingest_service_dry_run_redacts_token(tmp_path, monkeypatch) -> None:
