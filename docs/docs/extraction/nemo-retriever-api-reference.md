@@ -79,11 +79,17 @@ output because detections are unavailable.
 
 Native PDF text extraction with `method="pdfium"` and page-level image
 embedding remain compatible with `use_page_elements=False` when those
-stages are disabled. Nemotron Parse can extract text, tables, charts, and
-infographics without Page Elements when `use_table_structure=False`.
+stages are disabled. For PDF inputs, Nemotron Parse can extract text, tables,
+charts, and infographics without Page Elements when `use_table_structure=False`.
 The legacy `method="audio"` path also accepts `use_page_elements=False`
-with the default extraction flags because audio processing does not use
-Page Elements detections.
+with the default extraction flags for audio inputs because audio processing
+does not use Page Elements detections.
+
+Image inputs, including automatically routed images, use the detection/OCR
+pipeline regardless of `method`. Image ingestion raises `ValueError` before
+loading the image if `use_page_elements=False` and a detection-dependent OCR
+stage is enabled. The `nemotron_parse` and `audio` exemptions do not apply to
+image inputs.
 
 ### Choose raise or collect behavior
 
