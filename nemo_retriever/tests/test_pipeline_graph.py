@@ -960,7 +960,7 @@ class TestMultiTypeExtractOperator:
         [
             pytest.param(False, "pdfium", [], id="disabled"),
             pytest.param(True, "pdfium", [], id="enabled-without-consumer"),
-            pytest.param(False, "ocr", ["OCRActor"], id="disabled-with-independent-ocr"),
+            pytest.param(True, "ocr", ["PageElementDetectionActor", "OCRActor"], id="ocr-with-detections"),
         ],
     )
     def test_detection_pipeline_runs_only_needed_stages(
