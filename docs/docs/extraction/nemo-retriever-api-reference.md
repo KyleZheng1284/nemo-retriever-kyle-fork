@@ -57,7 +57,7 @@ require Page Elements detections. `ExtractParams` raises a Pydantic
 
 - `extract_text=True` with `method="ocr"` or `method="pdfium_hybrid"`.
 - `extract_tables=True`, `extract_charts=True`, or `extract_infographics=True`
-  with any method other than `nemotron_parse`.
+  with any method other than `nemotron_parse` or `audio`.
 - `use_table_structure=True` with `extract_tables=True`.
 
 Keep `use_page_elements=True` for these stages, or disable the stages that
@@ -68,6 +68,9 @@ Native PDF text extraction with `method="pdfium"` and page-level image
 embedding remain compatible with `use_page_elements=False` when those
 stages are disabled. Nemotron Parse can extract text, tables, charts, and
 infographics without Page Elements when `use_table_structure=False`.
+The legacy `method="audio"` path also accepts `use_page_elements=False`
+with the default extraction flags because audio processing does not use
+Page Elements detections.
 
 ### Choose raise or collect behavior
 

@@ -586,7 +586,7 @@ class ExtractParams(_ParamsModel):
             validate_nemotron_parse_endpoint_list(self.nemotron_parse_invoke_url or self.invoke_url)
         if not self.use_page_elements:
             consumers = [("use_table_structure", self.use_table_structure and self.extract_tables)]
-            if self.method != "nemotron_parse":
+            if self.method not in ("nemotron_parse", "audio"):
                 consumers.extend(
                     [
                         ("extract_text", self.extract_text and self.method in ("pdfium_hybrid", "ocr")),

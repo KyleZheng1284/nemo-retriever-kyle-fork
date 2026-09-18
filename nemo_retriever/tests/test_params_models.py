@@ -109,6 +109,15 @@ class TestExtractParams:
 
         assert params.use_page_elements is False
 
+    def test_audio_page_elements_opt_out_preserves_document_defaults(self) -> None:
+        params = ExtractParams(method="audio", use_page_elements=False)
+
+        assert params.use_page_elements is False
+        assert params.extract_text is True
+        assert params.extract_images is True
+        assert params.extract_tables is True
+        assert params.extract_charts is True
+
     def test_page_elements_opt_out_still_rejects_table_structure(self) -> None:
         with pytest.raises(ValidationError, match="use_table_structure"):
             ExtractParams(use_page_elements=False, use_table_structure=True, extract_tables=True)
