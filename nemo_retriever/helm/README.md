@@ -990,6 +990,7 @@ gated on three conditions ALL holding:
 | `nimOperator.vlm_embed.enabled`        | `true`  | Multimodal embedding NIM (also used by the vectordb Pod). |
 | `nimOperator.vlm_embed.nimServiceName` | `llama-nemotron-embed-vl-1b-v2` | NIMService / in-cluster DNS name. |
 | `nimOperator.vlm_embed.image`          | `nvcr.io/nim/nvidia/llama-nemotron-embed-vl-1b-v2:2.3.0` | Default VLM embed NIM image. |
+| `nimOperator.vlm_embed.cacheEnv` | `[]` | Environment variables for the embedding NIMCache download job (`spec.env`). Empty omits the field. Separate from `nimOperator.vlm_embed.env`, which configures the NIMService. |
 | `nimOperator.rerankqa.enabled`         | `false` | VL reranker NIM (optional). Set `true` to opt in — refer to [Query-time reranking](#query-time-reranking). Default `false` so chart installs honor the "optional and disabled by default" contract in [deployment-options.md](https://github.com/NVIDIA/NeMo-Retriever/blob/main/docs/docs/extraction/deployment-options.md) and do not silently provision an extra ≈ 3.1 GiB GPU NIM. The image points at the **VL** SKU (`llama-nemotron-rerank-vl-1b-v2`) per [prerequisites-support-matrix.md](https://github.com/NVIDIA/NeMo-Retriever/blob/main/docs/docs/extraction/prerequisites-support-matrix.md#default-helm-nims) — the text-only `llama-nemotron-rerank-1b-v2` silently degrades multimodal reranking and is not the documented POR. |
 | `nimOperator.rerankqa.image`           | `nvcr.io/nim/nvidia/llama-nemotron-rerank-vl-1b-v2:2.3.0` | Default optional VL reranker NIM image. |
 | `nimOperator.nemotron_parse.enabled`   | `false` | Structured-parse NIM (optional). Set `true` when using `method="nemotron_parse"`. Default `false` so chart installs honor the "optional and disabled by default" contract in [deployment-options.md](https://github.com/NVIDIA/NeMo-Retriever/blob/main/docs/docs/extraction/deployment-options.md). Image tags follow the [image tag conventions](#image-tag-conventions). |
@@ -1081,6 +1082,53 @@ Tips:
 - Run `ngc registry model list-profiles nvcr.io/nim/nvidia/<image>:<tag>` to enumerate the available profiles for any chart-pinned NIM image and pick the smallest profile that matches your GPU.
 - Filter mismatches surface as `NIMCache` events such as `NoCompatibleProfile`; check with `kubectl describe nimcache <name>`.
 - The chart's defaults (`{}`) preserve operator behaviour, so adding `modelProfile` is a strict opt-in — existing releases keep working unchanged.
+
+#### Nemotron 3 Embed on SM120 { #nemotron-3-embed-sm120 }
+
+For a text-only embedding deployment on RTX PRO 6000 Blackwell (SM120),
+[the Nemotron 3 Embed example](./examples/values-nemotron-3-embed-sm120.yaml)
+replaces the `vlm_embed` slot with `nemotron-3-embed-1b:2.2.2` and sets
+`serviceConfig.vectordb.embedModel` to `nvidia/nemotron-3-embed-1b`.
+This opt-in replacement does not provide the default
+`llama-nemotron-embed-vl-1b-v2` model's image embedding capability.
+
+For this image's native download path, the `modelProfile.gpus` filter
+alone does not select checkpoint precision. A cache job without GPU
+visibility can download BF16 weights while the SM120 service selects
+NVFP4 and fails with a missing `layers.0.self_attn.q_proj.weight_scale`.
+Set `NIM_ENGINE_PRECISION=nvfp4` for both the cache job and the service.
+The example includes the following independent environment lists:
+
+```yaml
+nimOperator:
+  vlm_embed:
+    cacheEnv:
+      - name: NIM_ENGINE_PRECISION
+        value: nvfp4
+    env:
+      - name: NIM_HTTP_API_PORT
+        value: "8000"
+      - name: NIM_ENGINE_PRECISION
+        value: nvfp4
+```
+
+`cacheEnv` renders only on the embedding `NIMCache`. It does not inherit
+`env`, service telemetry settings, or service-only environment variables.
+Keep the HTTP port in `env` when you replace that list.
+
+Use a fresh NIMCache and empty PVC for this precision change. Updating
+only the service environment does not replace weights in an existing cache.
+For an isolated installation, use a new namespace with the required NGC
+Secrets and storage configuration, then pass the example with
+`-f nemo_retriever/helm/examples/values-nemotron-3-embed-sm120.yaml`.
+Do not delete shared caches or PVCs. Plan a separate migration for an
+existing deployment before removing any resources it uses.
+
+Confirm the download job selects NVFP4, then check that the NIMService
+becomes ready and serves a text `/v1/embeddings` request. Cache readiness
+alone does not verify that the service can load the checkpoint.
+For diagnosis, refer to
+[Nemotron 3 Embed fails with a missing weight scale on SM120](https://github.com/NVIDIA/NeMo-Retriever/blob/main/docs/docs/extraction/troubleshoot.md#nemotron-3-embed-sm120-weight-scale).
 
 #### Image tag conventions { #image-tag-conventions }
 

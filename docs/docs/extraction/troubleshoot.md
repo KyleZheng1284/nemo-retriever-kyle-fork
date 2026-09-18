@@ -227,6 +227,42 @@ you must set `EMBEDDER_BATCH_SIZE=3` in the process environment. For example, ru
 
 
 
+## Nemotron 3 Embed fails with a missing weight scale on SM120 { #nemotron-3-embed-sm120-weight-scale }
+
+When you replace the Helm embedding slot with
+`nvcr.io/nim/nvidia/nemotron-3-embed-1b:2.2.2` on RTX PRO 6000 Blackwell
+(SM120), the NIMCache can complete while the NIMService repeatedly fails
+with the following missing tensor:
+
+```text
+layers.0.self_attn.q_proj.weight_scale
+```
+
+For this image's native download path, a cache job without GPU visibility
+can select BF16 weights while the SM120 service selects NVFP4.
+The BF16 checkpoint lacks the NVFP4 scale tensors.
+A GPU filter under `nimOperator.vlm_embed.modelProfile.gpus` does not
+set checkpoint precision for that download path.
+
+Complete the following steps:
+
+1. Set `NIM_ENGINE_PRECISION=nvfp4` in both
+   `nimOperator.vlm_embed.cacheEnv` and `nimOperator.vlm_embed.env`.
+   The first list configures the NIMCache download job; the second configures
+   the NIMService. Preserve `NIM_HTTP_API_PORT=8000` in the service list.
+2. Provision a fresh NIMCache and empty PVC with these settings.
+   Reusing BF16 cache contents can preserve the failure even after you
+   update the service environment. Use an isolated namespace for validation.
+   Do not delete shared caches or PVCs.
+3. Verify that the download job selects NVFP4 and the NIMService becomes
+   ready. Send a text `/v1/embeddings` request to verify model loading and
+   inference; a completed cache job alone is insufficient.
+
+This workaround applies to the text-only Nemotron 3 Embed replacement.
+The chart still defaults to the multimodal `llama-nemotron-embed-vl-1b-v2`
+model. For the complete override file and deployment guidance, refer to
+[Nemotron 3 Embed on SM120](https://github.com/NVIDIA/NeMo-Retriever/blob/main/nemo_retriever/helm/README.md#nemotron-3-embed-sm120).
+
 ## ModuleNotFoundError: No module named open_clip when using nemotron_parse { #modulenotfounderror-no-module-named-open-clip-when-using-nemotron-parse }
 
 When you run PDF extraction with `method="nemotron_parse"`, you might see an error similar to the following:

@@ -1,0 +1,27 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.
+# All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Text-only Nemotron-3 Embed 1B on RTX PRO 6000 Blackwell (SM120).
+# Replaces the default multimodal embed NIM. Use a fresh namespace/cache/PVC
+# when switching artifacts; existing BF16 weights are not converted.
+nimOperator:
+  vlm_embed:
+    nimServiceName: nemotron-3-embed-1b
+    image:
+      repository: nvcr.io/nim/nvidia/nemotron-3-embed-1b
+      tag: "2.2.2"
+    modelProfile:
+      gpus:
+        - ids: ["2BB5"]
+    cacheEnv:
+      - name: NIM_ENGINE_PRECISION
+        value: nvfp4
+    env:
+      - name: NIM_HTTP_API_PORT
+        value: "8000"
+      - name: NIM_ENGINE_PRECISION
+        value: nvfp4
+serviceConfig:
+  vectordb:
+    embedModel: nvidia/nemotron-3-embed-1b
