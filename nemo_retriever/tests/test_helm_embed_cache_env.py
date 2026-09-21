@@ -39,6 +39,7 @@ class TestEmbedCacheEnv(TestCase):
 
     def test_default_cache_has_no_extra_environment(self):
         docs = self.render()
+        self.assertTrue(any(d["kind"] == "NIMCache" and d["metadata"]["name"] == "nemotron-3-embed-1b" for d in docs))
         for doc in docs:
             if doc["kind"] == "NIMCache":
                 self.assertNotIn("env", doc["spec"])
@@ -52,9 +53,10 @@ class TestEmbedCacheEnv(TestCase):
             },
         ]
         docs = self.render({"nimOperator": {"vlm_embed": {"cacheEnv": env}}})
+        self.assertTrue(any(d["kind"] == "NIMCache" and d["metadata"]["name"] == "nemotron-3-embed-1b" for d in docs))
         for doc in docs:
             if doc["kind"] == "NIMCache":
-                if doc["metadata"]["name"] == "llama-nemotron-embed-vl-1b-v2":
+                if doc["metadata"]["name"] == "nemotron-3-embed-1b":
                     self.assertEqual(doc["spec"]["env"], env)
                 else:
                     self.assertNotIn("env", doc["spec"])
@@ -70,6 +72,7 @@ class TestEmbedCacheEnv(TestCase):
             for doc in docs
             if doc["kind"] in ("NIMCache", "NIMService") and doc["metadata"]["name"] == "nemotron-3-embed-1b"
         ]
+        self.assertEqual({doc["kind"] for doc in pair}, {"NIMCache", "NIMService"})
         self.assertEqual(len(pair), 2)
         for doc in pair:
             env = {item["name"]: item.get("value") for item in doc["spec"]["env"]}
@@ -80,6 +83,9 @@ class TestEmbedCacheEnv(TestCase):
                 self.assertEqual(ngc["modelPuller"], "nvcr.io/nim/nvidia/nemotron-3-embed-1b:2.2.2")
             else:
                 self.assertEqual(doc["spec"]["resources"]["limits"]["nvidia.com/gpu"], 1)
+                defaults = yaml.safe_load((CHART / "values.yaml").read_text())["nimOperator"]["vlm_embed"]["env"]
+                for item in defaults:
+                    self.assertIn(item, doc["spec"]["env"])
         config = next(
             doc
             for doc in docs
