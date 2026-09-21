@@ -6,6 +6,10 @@
 # Use a fresh cache/PVC; existing BF16 weights are not converted.
 nimOperator:
   vlm_embed:
+    # Label compatible SM120 nodes accelerator=sm120, or use your cluster
+    # selector. Without a matching node, cache and service pods stay Pending.
+    nodeSelector:
+      accelerator: sm120
     modelProfile:
       gpus:
         - ids: ["2BB5"]

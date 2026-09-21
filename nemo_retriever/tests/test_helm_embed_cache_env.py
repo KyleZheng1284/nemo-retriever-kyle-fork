@@ -75,6 +75,7 @@ class TestEmbedCacheEnv(TestCase):
         self.assertEqual({doc["kind"] for doc in pair}, {"NIMCache", "NIMService"})
         self.assertEqual(len(pair), 2)
         for doc in pair:
+            self.assertEqual(doc["spec"]["nodeSelector"], {"accelerator": "sm120"})
             env = {item["name"]: item.get("value") for item in doc["spec"]["env"]}
             self.assertEqual(env["NIM_ENGINE_PRECISION"], "nvfp4")
             if doc["kind"] == "NIMCache":

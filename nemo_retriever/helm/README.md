@@ -1592,7 +1592,14 @@ For `nemotron-3-embed-1b:2.2.2` on RTX PRO 6000 Blackwell (SM120), use
 [the SM120 example](./examples/values-nemotron-3-embed-sm120.yaml) to set
 `NIM_ENGINE_PRECISION=nvfp4` for both the cache download and the service.
 This avoids caching BF16 weights that lack the scale tensors required by
-the NVFP4 runtime. The GPU profile filter alone does not select precision.
+the NVFP4 runtime. The GPU profile filter alone does not select precision
+or constrain scheduling.
+
+The example selects nodes with the administrator-assigned label
+`accelerator=sm120`. Label only nodes whose allocatable GPUs are all
+compatible SM120 GPUs, or replace the selector with equivalent existing
+cluster labels. A node selector cannot choose between GPU types within a
+mixed-GPU node. Without a matching eligible node, the service pod stays Pending.
 
 `nimOperator.vlm_embed.cacheEnv` configures only the NIMCache download job;
 `nimOperator.vlm_embed.env` configures the NIMService. These lists are
