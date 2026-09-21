@@ -88,10 +88,6 @@ class TestEmbedCacheEnv(TestCase):
                 for item in defaults:
                     self.assertIn(item, doc["spec"]["env"])
         config = next(
-            doc
-            for doc in docs
-            if doc["kind"] == "ConfigMap" and "retriever-service.yaml" in doc.get("data", {})
+            doc for doc in docs if doc["kind"] == "ConfigMap" and "retriever-service.yaml" in doc.get("data", {})
         )
-        self.assertIn(
-            'embed_model_name: "nvidia/nemotron-3-embed-1b"', config["data"]["retriever-service.yaml"]
-        )
+        self.assertIn('embed_model_name: "nvidia/nemotron-3-embed-1b"', config["data"]["retriever-service.yaml"])
