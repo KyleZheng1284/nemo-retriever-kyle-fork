@@ -109,6 +109,7 @@ class NemotronParseV12(BaseModel):
         self._llm = LLM(
             model=model_path,
             revision=revision,
+            tokenizer_revision=revision,
             trust_remote_code=True,
             dtype="bfloat16",
             max_num_seqs=max_num_seqs,
@@ -195,6 +196,14 @@ class NemotronParseV12(BaseModel):
         making this significantly faster than sequential single-image calls
         for large batches.
         """
+        return [text.strip() for text, _ in self._invoke_batch_with_finish_reasons(inputs, task_prompt=task_prompt)]
+
+    def _invoke_batch_with_finish_reasons(
+        self,
+        inputs: Sequence[ImageInput],
+        task_prompt: Optional[str] = None,
+    ) -> List[tuple[str, str]]:
+        """Run a batch while retaining vLLM completion status for pipeline validation."""
         prompt = task_prompt or self._task_prompt
         prompts = [
             {
@@ -207,7 +216,11 @@ class NemotronParseV12(BaseModel):
             for img in inputs
         ]
         outputs = self._llm.generate(prompts, self._sampling_params)
-        return [out.outputs[0].text.strip() for out in outputs]
+        return [
+            (completion.text, str(completion.finish_reason or "unknown"))
+            for output in outputs
+            for completion in output.outputs[:1]
+        ]
 
     def __call__(
         self,

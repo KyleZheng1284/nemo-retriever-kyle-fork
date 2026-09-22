@@ -34,6 +34,8 @@ For PDFs, NeMo Retriever Library typically uses **pdfium**-based extraction with
 - [NeMo Retriever Library Overview](overview.md)
 - [OCR and scanned documents](#ocr-and-scanned-documents)
 - [Chunking](concepts.md#chunking)
+- [NVIDIA NeMo Curator Nemotron Parse PDF pipeline source](https://github.com/NVIDIA-NeMo/Curator/blob/main/nemo_curator/stages/interleaved/pdf/nemotron_parse/composite.py)
+- [NVIDIA NeMo Curator Nemotron Parse PDF tutorial](https://github.com/NVIDIA-NeMo/Curator/tree/main/tutorials/interleaved/nemotron_parse_pdf)
 
 ## Tables { #tables }
 
@@ -115,6 +117,10 @@ Chart-classified PDF regions stay on the layout/OCR path; only non-chart image r
 ## Metadata and content schema { #metadata-and-content-schema }
 
 Extracted objects follow the schema and field descriptions in the [Metadata reference](content-metadata.md). Use that page for tables, types, and per-field notes.
+
+With `method="nemotron_parse"`, each page row in the returned extraction `DataFrame` includes a `nemotron_parse_v1_2` metadata dictionary. Its `raw_output` field contains the model response passed to element routing. A value of `None` means that no model response was available; an empty response is stored as `""`. This additive metadata does not change routing into the existing `text`, `table`, `chart`, and `infographic` fields.
+
+For bundled local v1.2 inference, any vLLM finish reason other than `stop` records a structured error in `nemotron_parse_v1_2.error`. Its `type` is `IncompleteModelOutputError`, and its `stage` is `nemotron_parse_pages_finish_reason`. NeMo Retriever Library still routes any returned prefix into content fields. Consumers that require complete pages must check `error`; they can use `raw_output` for diagnostics.
 
 ## Extraction limitations and quality { #extraction-limitations-and-quality }
 
