@@ -278,6 +278,20 @@ def test_model_close_drops_the_offline_engine() -> None:
     assert model._llm is None
 
 
+def test_model_close_during_a_batch_keeps_that_batch_engine() -> None:
+    model = _local_wrapper([SimpleNamespace(outputs=[SimpleNamespace(text="page", finish_reason="stop")])])
+    engine = model._llm
+
+    def close_while_preprocessing(image):
+        model.close()
+        return image
+
+    model.preprocess = close_while_preprocessing
+
+    assert model.invoke_batch_with_finish_reasons(["image"]) == [("page", "stop")]
+    engine.generate.assert_called_once()
+
+
 def test_parse_playground_accepts_only_the_supported_v1_2_model():
     from nemo_retriever.harness.portal.app import ParseTestRequest
 
