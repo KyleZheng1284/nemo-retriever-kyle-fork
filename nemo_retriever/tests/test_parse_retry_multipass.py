@@ -415,3 +415,41 @@ def test_graph_entrypoints_share_parse_policy_and_render_before_inference(monkey
     monkeypatch.setattr(operator, "_maybe_chunk", lambda data, _mode: data)
     operator._run_pdf_pipeline(pd.DataFrame([{"path": "fixture.pdf", "bytes": b"pdf"}]))
     assert calls == ["render", "parse"]
+
+
+def test_retry_picture_projection_uses_selected_content_coordinates(monkeypatch):
+    pytest.importorskip("nemotron_parse.inference")
+    from nemo_retriever.ingestor.interleaved import project_page
+
+    monkeypatch.setattr(
+        served, "prepare_retry", lambda *a, **k: (Image.new("RGB", (220, 170), "green"), "changed_rendering")
+    )
+    picture = "<x_0.1><y_0.1>Figure<x_0.9><y_0.9><class_Picture>"
+    frame = pd.DataFrame(
+        [
+            {
+                "path": "landscape.pdf",
+                "page_number": 7,
+                "page_image": {"image_b64": image_b64("red"), "orig_shape_hw": [120, 100]},
+                rendering.PAGE_PDF_COLUMN: b"pdf",
+            }
+        ]
+    )
+    result = (
+        stage.nemotron_parse_pages(
+            frame,
+            invoke_url=URL,
+            nemotron_parse_model=MODEL,
+            nim_client=Client([response("cut", "length"), response(picture)]),
+        )
+        .iloc[0]
+        .to_dict()
+    )
+    assert result["nemotron_parse_v1_2"]["selected_attempt"] == 1
+    assert result["nemotron_parse_v1_2"]["bbox_coordinate_space"] == "normalized_page_content"
+    (projected,) = project_page(result)
+    assert projected["materialize_error"] is None
+    assert projected["page_number"] == 6
+    with Image.open(io.BytesIO(projected["binary_content"])) as crop:
+        assert crop.size == (176, 136)
+        assert crop.getextrema() == ((0, 0), (128, 128), (0, 0))
