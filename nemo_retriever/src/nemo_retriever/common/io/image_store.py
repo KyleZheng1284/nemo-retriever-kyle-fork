@@ -11,6 +11,8 @@ import logging
 
 from upath import UPath
 
+from nemo_retriever.common.api.util.pdf.process_lock import serialized_pdfium
+
 logger = logging.getLogger(__name__)
 
 
@@ -36,6 +38,7 @@ def load_image_b64_from_uri(uri: str) -> str | None:
         return None
 
 
+@serialized_pdfium
 def render_page_image_b64(pdf_path: str, page_number: int, *, dpi: int = 300) -> str | None:
     """Render a 1-indexed PDF page to the extraction pipeline's base64 image format."""
     try:
@@ -49,8 +52,11 @@ def render_page_image_b64(pdf_path: str, page_number: int, *, dpi: int = 300) ->
             if page_idx < 0:
                 return None
             page = doc[page_idx]
-            render_info = _render_page_to_base64(page, dpi=dpi)
-            return render_info.get("image_b64")
+            try:
+                render_info = _render_page_to_base64(page, dpi=dpi)
+                return render_info.get("image_b64")
+            finally:
+                page.close()
         finally:
             doc.close()
     except Exception as exc:

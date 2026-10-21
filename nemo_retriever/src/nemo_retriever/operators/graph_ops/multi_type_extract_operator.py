@@ -311,6 +311,9 @@ class _MultiTypeExtractBase(AbstractOperator):
         parse_mode = _parse_mode_enabled(extract_params)
 
         if parse_mode:
+            extract_kwargs = build_pdf_extraction_kwargs(extract_params)
+            extract_kwargs["extract_page_as_image"] = True
+            batch_df = PDFExtractionActor(**extract_kwargs).run(batch_df)
             parse_kwargs: dict[str, Any] = {
                 "extract_text": extract_params.extract_text,
                 "extract_tables": extract_params.extract_tables,
@@ -323,8 +326,17 @@ class _MultiTypeExtractBase(AbstractOperator):
                 parse_kwargs["invoke_url"] = extract_params.invoke_url
             if extract_params.nemotron_parse_model:
                 parse_kwargs["nemotron_parse_model"] = extract_params.nemotron_parse_model
+            parse_kwargs.update(
+                nemotron_parse_mode=extract_params.nemotron_parse_mode,
+                nemotron_parse_triple_regions=extract_params.nemotron_parse_triple_regions,
+                nemotron_parse_rendering_retry=extract_params.nemotron_parse_rendering_retry,
+            )
             if extract_params.api_key:
                 parse_kwargs["api_key"] = extract_params.api_key
+            parse_kwargs.update(
+                request_timeout_s=extract_params.request_timeout_s,
+                **extract_params.remote_retry.model_dump(),
+            )
             batch_df = self._instantiate_resolved(NemotronParseActor, **parse_kwargs).run(batch_df)
         else:
             # standard non-parse path: continue with PDFExtractionActor and detection

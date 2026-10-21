@@ -10,7 +10,6 @@ import warnings
 from typing import Any, ClassVar, Literal, Optional, Tuple
 from urllib.parse import urlparse
 
-
 from upath import UPath
 
 from pydantic import (
@@ -583,6 +582,12 @@ class ExtractParams(_ParamsModel):
     table_structure_invoke_url: Optional[str] = None
     nemotron_parse_invoke_url: Optional[str] = None
     nemotron_parse_model: Optional[str] = None
+    nemotron_parse_mode: Literal["single", "double", "triple"] = "single"
+    nemotron_parse_triple_regions: Literal["union", "detector"] = "union"
+    nemotron_parse_rendering_retry: bool | None = Field(
+        default=None,
+        description="Retry eligible full-page generation once with changed rendering; defaults on for served Parse 3.5.",
+    )
 
     # Output columns
     output_column: str = "page_elements_v3"
@@ -612,7 +617,11 @@ class ExtractParams(_ParamsModel):
                 "extract_nested_images=True requires extract_images=True because nested images extend image output."
             )
         if self.method != "nemotron_parse" and (
-            self.nemotron_parse_invoke_url is not None or self.nemotron_parse_model is not None
+            self.nemotron_parse_invoke_url is not None
+            or self.nemotron_parse_model is not None
+            or self.nemotron_parse_mode != "single"
+            or self.nemotron_parse_triple_regions != "union"
+            or self.nemotron_parse_rendering_retry is not None
         ):
             raise ValueError(
                 "`nemotron_parse_invoke_url` and `nemotron_parse_model` require "
@@ -630,6 +639,17 @@ class ExtractParams(_ParamsModel):
                     f"received `{self.nemotron_parse_model}`. Configure `nemotron_parse_invoke_url` or `invoke_url` "
                     "to use a compatible remote model."
                 )
+            document_contract = (
+                str(self.nemotron_parse_model or "").lower() in {"nvidia/nemotron-3.5-parse", "nemotron-3.5-parse"}
+                and bool(parse_endpoints)
+                and all(urlparse(url).path.rstrip("/") == "/v1/chat/completions" for url in parse_endpoints)
+            )
+            if (
+                self.nemotron_parse_mode != "single" or self.nemotron_parse_triple_regions != "union"
+            ) and not document_contract:
+                raise ValueError("Multipass requires served Parse 3.5 through /v1/chat/completions.")
+            if self.nemotron_parse_rendering_retry is True and parse_endpoints and not document_contract:
+                raise ValueError("Rendering retry supports local Parse v1.2 or served Parse 3.5 chat completions.")
             if parse_endpoints and self.batch_tuning.nemotron_parse_batches_in_flight > 1:
                 raise ValueError(
                     "`batch_tuning.nemotron_parse_batches_in_flight` above 1 requires local Nemotron Parse; "

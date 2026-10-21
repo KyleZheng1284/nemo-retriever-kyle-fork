@@ -110,9 +110,11 @@ result, failures = (
 
 `Nemotron-3.5-Parse` is also accepted as the model name when it matches the
 server configuration. These names select the model-team `DocumentParser`
-single-pass path. That path uses the package's full-page prompt and sampling
-settings; the library's legacy `task_prompt` does not override them. Other
-model names do not select this adapter.
+path only with the exact `/v1/chat/completions` endpoint. Its default mode is `single`; `double` and `triple` add table/chart
+refinement stages. The package owns each stage's prompt and sampling settings;
+the library's legacy `task_prompt` does not override them. Other model names
+do not select this adapter. Eligible full-page failures receive one changed
+rendering retry by default on this served 3.5 path.
 
 Remote requests use the existing NIM transport and retry configuration.
 `remote_retry.remote_max_pool_workers` limits concurrent page requests per
@@ -128,6 +130,150 @@ produce an installation error instead of selecting another model.
 The native Nemotron Parse NIM uses a different `/v1/parse` contract. Refer to
 [Parse endpoint contracts](prerequisites-support-matrix.md#nemotron-parse-hosted-vs-self-hosted)
 before changing an existing NIM endpoint.
+
+### Choose single, double, or triple pass { #nemotron-parse-multipass }
+
+Set `nemotron_parse_mode` through `.extract()` or `ExtractParams`. Multipass
+requires the served Parse 3.5 chat-completions contract described above. It is
+not available for local v1.2, hosted Build, or native NIM `/v1/parse` endpoints.
+
+The modes perform the following stages.
+
+| Mode | Stages |
+| --- | --- |
+| `single` | Parse the whole page. |
+| `double` | Parse the whole page, crop its predicted table/chart regions, parse each crop, then merge. |
+| `triple` | Parse the whole page, request boxes and element types without transcription, crop the selected table/chart regions, parse each crop, then merge. |
+
+A pass describes a stage, not one request. Each selected crop adds a request;
+triple pass also adds a boxes-only request for the page. The extra stages do
+not guarantee a better extraction or a better crop.
+
+The following example enables triple pass and retains errors for inspection.
+
+```python
+from nemo_retriever import create_ingestor
+
+result, failures = (
+    create_ingestor(run_mode="batch")
+    .files(["report.pdf"])
+    .extract(
+        method="nemotron_parse",
+        nemotron_parse_invoke_url="http://localhost:8000/v1/chat/completions",
+        nemotron_parse_model="nvidia/Nemotron-3.5-Parse",
+        nemotron_parse_mode="triple",
+        nemotron_parse_triple_regions="union",
+        nemotron_parse_rendering_retry=True,
+        extract_text=True,
+        extract_tables=True,
+        extract_charts=True,
+    )
+    .ingest(return_failures=True)
+)
+```
+
+The settings have these defaults and meanings.
+
+| Setting | Default | Behavior |
+| --- | --- | --- |
+| `nemotron_parse_mode` | `"single"` | Select `single`, `double`, or `triple`. |
+| `nemotron_parse_triple_regions` | `"union"` | In triple mode, combine detector regions with nonoverlapping first-pass table/chart regions. Set `"detector"` to use only detector proposals. |
+| `nemotron_parse_rendering_retry` | `None` | Automatically enable one changed-rendering retry for served Parse 3.5 at `/v1/chat/completions`. Other paths, including native `/v1/parse`, default to no rendering retry. Set `False` to disable it, or `True` to enable it explicitly where supported. |
+
+The library calls the installed model-team
+[`DocumentParser`](https://huggingface.co/nvidia/Nemotron-3.5-Parse/blob/e7ea79242a87ea0ad3919b672bfedb429a683206/nemotron_parse/inference.py),
+which uses its published geometry, crop, postprocessing, and merge logic.
+The adapter does not copy these algorithms into the library. Full-page and
+crop requests use the package's transcription prompt; detection uses its
+boxes-only prompt. Sampling settings remain specific to each stage.
+
+The pinned package's default `alternatives` merge policy can retain differing
+structural hypotheses before applying guarded table replacement. The result
+is not necessarily a simple replacement of every original table. Inspect
+`inference` and `stages` in the page metadata for effective settings, proposed
+regions, crop responses, and the selected mode.
+
+For served 3.5, `raw_output` retains the selected full-page generation before
+refinement. `routing_output` retains the final tagged output after the package
+has applied its processing and merge rules. Element routing and interleaved
+Parquet export use `routing_output`, so merged crop content reaches the export
+without replacing the original full-page evidence.
+
+A detection or crop failure marks that page failed. It does not trigger a
+changed-rendering retry or silently downgrade the page to single pass.
+Successful sibling pages remain available. Increasing the number of stages
+can increase requests, latency, and storage even when extraction quality does
+not improve.
+
+### Retry eligible full-page failures with a changed rendering { #nemotron-parse-rendering-retry }
+
+The rendering retry is separate from HTTP transport retries and from table/chart
+refinement. It applies only when a full-page response reaches
+`finish_reason="length"`, or returns empty text with `finish_reason="stop"`.
+Malformed nonempty output, invalid boxes, detection failures, and crop failures
+are not rendering-retry triggers.
+
+The library retains the single-page PDF through the Parse stage. For an
+eligible failure, it can render that page again to fit within 1,664 × 2,048
+pixels while preserving aspect ratio. It skips the retry when the original
+raster already fits, the source page PDF is unavailable, or the effective input
+would be unchanged. This is a change in rasterization, not an increase in the
+output token budget.
+
+For served Parse 3.5, the equality check uses the image processor from the
+pinned model revision. The first eligible retry lazily loads that processor
+with `trust_remote_code=True`; it loads processor metadata and code, not model
+weights. Keep the pinned processor available in the configured Hugging Face
+cache for offline runs. If loading or rendering fails, the page retains an
+error and the original response evidence.
+
+A page receives at most one additional full-page generation through this
+mechanism. The replacement must return nonempty text with `finish_reason="stop"`.
+Otherwise, the original full-page response remains selected for diagnostics.
+The selected output still goes through the normal parsing and projection
+checks; a completed retry is not proof of a correct extraction.
+
+When a retry is selected, `page_image` becomes the retry raster so downstream
+picture crops use the same image that produced the selected result. The
+original and retry images remain in the attempt records. The temporary
+single-page PDF column is removed after Parse processing.
+
+Local v1.2 supports an explicit `nemotron_parse_rendering_retry=True` when the
+model exposes completion finish reasons. Its default remains off. The local
+path compares raster pixels directly; the served 3.5 path compares processed
+model inputs. Other remote contracts reject an explicit rendering retry.
+
+### Inspect retry and multipass evidence { #nemotron-parse-attempt-evidence }
+
+Served 3.5 pages record their logical stage calls in
+`nemotron_parse_v1_2.attempts`. Local v1.2 records full-page attempts when its
+rendering retry is enabled. Each record includes the following evidence.
+
+- A client-generated `attempt_id`, stage, and rendering attempt number: `0`
+  for the original raster or `1` for the changed raster.
+- `page_identity`, including source path, source ID, physical page number, and
+  the single-page PDF hash when available.
+- `input_image`, including the submitted PNG bytes as base64, its SHA-256,
+  and raster dimensions.
+- The effective prompt and sampling settings, start/end timestamps, raw
+  response, finish reason, token usage when available, and request errors.
+
+These are logical stage records, not provider-issued request IDs or a ledger
+of every transport retry. Existing HTTP retry settings can make multiple wire
+requests within one record. The evidence can substantially increase native
+Parquet size because it retains actual page and crop images.
+
+`selected_attempt` identifies the selected full-page rendering attempt.
+`rendering_retry` reports whether retry was enabled, attempted, and selected;
+when preparation was considered, it also records the preparation outcome.
+A selected retry can still have a later detection, crop, or projection error.
+Check the page's `error` and the exported `materialize_error` as applicable.
+
+For a controlled comparison, hold model revision, source pages, rendering,
+concurrency, and retry setting fixed while changing `nemotron_parse_mode`.
+Use `nemotron_parse_rendering_retry=False` when you need a strict single-attempt
+control. Measure validated output, wall time, and resource use together; more
+busy GPU time alone does not establish better throughput or quality.
 
 ## PDF image extraction { #pdf-image-extraction }
 
@@ -315,12 +461,16 @@ The following fields support page-level diagnostics.
 
 | Field | Meaning |
 | --- | --- |
-| `raw_output` | Model response before element routing. `None` means no response was available; `""` means an empty response. Whitespace normalization depends on the endpoint contract. |
+| `raw_output` | Model response before element routing; for served 3.5, the selected full-page response before refinement. `None` means no response was available; `""` means an empty response. Whitespace normalization depends on the endpoint contract. |
+| `routing_output` | Served 3.5 tagged output after package processing and merging, used for element routing and interleaved Parquet export. Check `error` before using this output. |
 | `finish_reason` | Completion reason when the backend provides it. Local v1.2 uses `unknown` when its completion reason is missing. |
 | `usage` | Backend token usage when available. Local v1.2 does not populate usage. |
 | `error` | Failure details, including `stage`, `type`, and `message`. Some failures also include a traceback. |
 | `native_parse` | Native `/v1/parse` completion metadata, retained alongside the common fields for compatibility. |
 | `stages` and `inference` | Raw stage responses and effective model-package settings for successful served 3.5 calls. |
+| `attempts` | Logical stage-call evidence for served 3.5 and retry-enabled local v1.2, including actual input images and responses. |
+| `selected_attempt` | Selected full-page raster attempt: `0` for the original or `1` for the rendering retry. |
+| `rendering_retry` | Retry enablement, attempted/selected flags, and preparation outcome when applicable. |
 
 Local v1.2 and chat responses with an available finish reason other than
 `stop` or `eos` receive an `IncompleteModelOutputError` at
@@ -328,8 +478,9 @@ Local v1.2 and chat responses with an available finish reason other than
 prefix in content fields. Consumers that require complete pages must inspect
 `error`, rather than treating nonempty text as success.
 
-The served 3.5 adapter rejects empty or incomplete full-page responses before
-element routing and records the error on the affected page. The native
+After any eligible rendering retry, the served 3.5 adapter rejects remaining
+empty or incomplete full-page responses before element routing and records
+the error on the affected page. The native
 `/v1/parse` client rejects `finish_reason="length"` and retains its existing
 batch failure behavior. For that rejection, the failing page retains its raw
 response and completion metadata. Both `get_error_rows()` and

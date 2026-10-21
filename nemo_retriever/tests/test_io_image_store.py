@@ -31,14 +31,22 @@ class TestLoadImageB64FromUri:
 
 class TestRenderPageImageB64:
     def test_renders_one_indexed_pdf_page(self, monkeypatch):
-        closed = {"value": False}
+        closed = {"value": False, "page": False}
+
+        class _FakePage:
+            def __init__(self, index):
+                self.index = index
+
+            def close(self):
+                assert not closed["value"]
+                closed["page"] = True
 
         class _FakePdfDocument:
             def __init__(self, path):
                 self.path = path
 
             def __getitem__(self, index):
-                return f"page-{index}"
+                return _FakePage(index)
 
             def close(self):
                 closed["value"] = True
@@ -47,7 +55,7 @@ class TestRenderPageImageB64:
         fake_extract = types.ModuleType("nemo_retriever.operators.extract.pdf.extract")
 
         def _render_page_to_base64(page, *, dpi):
-            assert page == "page-1"
+            assert page.index == 1
             assert dpi == 123
             return {"image_b64": "rendered"}
 
@@ -56,7 +64,7 @@ class TestRenderPageImageB64:
         monkeypatch.setitem(sys.modules, "nemo_retriever.operators.extract.pdf.extract", fake_extract)
 
         assert render_page_image_b64("/tmp/doc.pdf", 2, dpi=123) == "rendered"
-        assert closed["value"] is True
+        assert closed == {"value": True, "page": True}
 
     def test_negative_page_returns_none(self, monkeypatch):
         class _FakePdfDocument:

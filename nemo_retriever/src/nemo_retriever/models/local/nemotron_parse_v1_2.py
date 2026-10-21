@@ -321,6 +321,24 @@ class NemotronParseV12(BaseModel):
         """Run Nemotron Parse on a single image and return the decoded text."""
         return self.invoke_batch([input_data], task_prompt=task_prompt)[0]
 
+    @property
+    def generation_settings(self) -> dict[str, Any]:
+        """Effective scalar sampling settings retained with rendering attempts."""
+        names = (
+            "temperature",
+            "top_p",
+            "top_k",
+            "max_tokens",
+            "min_tokens",
+            "repetition_penalty",
+            "presence_penalty",
+            "frequency_penalty",
+            "seed",
+            "ignore_eos",
+            "skip_special_tokens",
+        )
+        return {name: getattr(self._sampling_params, name, None) for name in names}
+
     def invoke_batch(
         self,
         inputs: Sequence[ImageInput],

@@ -839,6 +839,11 @@ def build_graph(
                 parse_kwargs["api_key"] = extract_params.api_key
             if extract_params.nemotron_parse_model:
                 parse_kwargs["nemotron_parse_model"] = extract_params.nemotron_parse_model
+            parse_kwargs.update(
+                nemotron_parse_mode=extract_params.nemotron_parse_mode,
+                nemotron_parse_triple_regions=extract_params.nemotron_parse_triple_regions,
+                nemotron_parse_rendering_retry=extract_params.nemotron_parse_rendering_retry,
+            )
             parse_kwargs.update(_nim_remote_http_kwargs(extract_params))
             if getattr(tuning, "nemotron_parse_batches_in_flight", 1) > 1:
                 parse_kwargs["async_engine"] = True

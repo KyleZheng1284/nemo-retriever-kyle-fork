@@ -12,12 +12,14 @@ import traceback
 
 import nvtx
 import pandas as pd
-from nemo_retriever.models.nim.error_reporter import report_error
+
+from nemo_retriever.common.api.util.pdf.process_lock import serialized_pdfium
 from nemo_retriever.common.params import PdfSplitParams
-from nemo_retriever.operators.abstract_operator import AbstractOperator
-from nemo_retriever.operators.cpu_operator import CPUOperator
 from nemo_retriever.graph.designer import designer_component
 from nemo_retriever.graph.executor import call_pandas_function_on_arrow
+from nemo_retriever.models.nim.error_reporter import report_error
+from nemo_retriever.operators.abstract_operator import AbstractOperator
+from nemo_retriever.operators.cpu_operator import CPUOperator
 from nemo_retriever.operators.operator_archetype import ArchetypeOperator
 
 try:
@@ -52,7 +54,8 @@ def _error_record(
     }
 
 
-def _split_pdf_to_single_page_bytes(pdf_binary: Any) -> List[bytes]:
+@serialized_pdfium
+def _split_pdf_to_single_page_bytes(pdf_binary: Any) -> list[bytes]:
     """
     Split a PDF into single-page PDFs (raw bytes) using pypdfium2.
     """

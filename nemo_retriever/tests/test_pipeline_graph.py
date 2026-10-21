@@ -1107,6 +1107,11 @@ class TestMultiTypeExtractOperator:
             lambda self, data: data,
         )
 
+        monkeypatch.setattr(
+            "nemo_retriever.operators.graph_ops.multi_type_extract_operator.PDFExtractionActor.run",
+            lambda self, data: data,
+        )
+
         def _fake_resolve(operator_class, resources, operator_kwargs=None):
             calls.append((operator_class.__name__, resources, operator_kwargs))
             return _IdentityStage

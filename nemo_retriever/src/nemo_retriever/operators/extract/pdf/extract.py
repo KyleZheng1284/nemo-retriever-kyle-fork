@@ -10,10 +10,15 @@ from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Tuple
 import base64
 import traceback
 
+from nemo_retriever.common.api.util.pdf.process_lock import serialized_pdfium
+
 try:
     import cv2
 except ImportError:
     cv2 = None
+
+import nvtx
+import pandas as pd
 
 from nemo_retriever.common.api.util.metadata.aggregators import Base64Image
 from nemo_retriever.common.api.util.pdf.pdfium import (
@@ -23,10 +28,9 @@ from nemo_retriever.common.api.util.pdf.pdfium import (
     is_scanned_page as _is_scanned_page,
 )
 
-import nvtx
-import pandas as pd
 
 from nemo_retriever.models.nim.error_reporter import report_error
+from nemo_retriever.models.nim.parse_rendering import PAGE_PDF_COLUMN, retry_enabled
 from nemo_retriever.operators.abstract_operator import AbstractOperator
 from nemo_retriever.operators.cpu_operator import CPUOperator
 from nemo_retriever.graph.designer import designer_component
@@ -78,6 +82,12 @@ def build_pdf_extraction_kwargs(params: ExtractParams) -> dict[str, Any]:
         "extract_infographics": params.extract_infographics,
         "extract_page_as_image": params.extract_page_as_image,
         "api_key": params.api_key,
+        "retain_page_pdf": params.method == "nemotron_parse"
+        and retry_enabled(
+            params.nemotron_parse_rendering_retry,
+            params.nemotron_parse_model,
+            params.nemotron_parse_invoke_url or params.invoke_url,
+        ),
     }
 
 
@@ -154,7 +164,10 @@ def _render_page_to_base64(
         render_scale = max(float(dpi) / 72.0, 0.01)
     bitmap = page.render(scale=render_scale)
 
-    arr = convert_bitmap_to_corrected_numpy(bitmap)
+    try:
+        arr = convert_bitmap_to_corrected_numpy(bitmap).copy()
+    finally:
+        bitmap.close()
 
     orig_h, orig_w = int(arr.shape[0]), int(arr.shape[1])
 
@@ -243,9 +256,13 @@ def _extract_page_text(page) -> str:
     The caller decides whether to use per-page or doc-level logic.
     """
     textpage = page.get_textpage()
-    return textpage.get_text_bounded()
+    try:
+        return textpage.get_text_bounded()
+    finally:
+        textpage.close()
 
 
+@serialized_pdfium
 def pdf_extraction(
     pdf_binary: Any,
     extract_text: bool = False,
@@ -261,6 +278,7 @@ def pdf_extraction(
     text_extraction_method: str = "pdfium_hybrid",
     text_depth: str = "page",
     render_mode: RenderMode = "fit_to_model",
+    retain_page_pdf: bool = False,
     **kwargs: Any,
 ) -> Any:
     """
@@ -445,6 +463,8 @@ def pdf_extraction(
                         # place to find the page image.
                         page_record["page_image"] = render_info
 
+                    if retain_page_pdf:
+                        page_record[PAGE_PDF_COLUMN] = bytes(pdf_bytes)
                     page_record.update(extra)
                     outputs.append(page_record)
                 finally:

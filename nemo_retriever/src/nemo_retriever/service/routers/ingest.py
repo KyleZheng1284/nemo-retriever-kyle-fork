@@ -32,6 +32,8 @@ from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field, model_validator
 from starlette.responses import StreamingResponse
 
+from nemo_retriever.common.api.util.pdf.process_lock import serialized_pdfium
+from nemo_retriever.common.policy import PolicyError, validate_pipeline_spec
 from nemo_retriever.common.schemas.collections import IngestOperation
 from nemo_retriever.common.schemas.pipeline_spec import PipelineSpec
 from nemo_retriever.common.schemas.requests import IngestRequest, JobCreateRequest
@@ -47,7 +49,6 @@ from nemo_retriever.common.schemas.responses import (
     SidecarUploadResponse,
 )
 from nemo_retriever.service.query_schema import AgenticAnswerResponse, QueryRequest, QueryResponse
-from nemo_retriever.common.policy import PolicyError, validate_pipeline_spec
 from nemo_retriever.models.llm.types import (
     AnswerRequest as CoreAnswerRequest,
     AnswerResult,
@@ -589,15 +590,17 @@ def _check_upload_size(file: UploadFile, request: Request) -> None:
         )
 
 
+@serialized_pdfium
 def _count_pdf_pages(file_bytes: bytes) -> int:
     """Return the number of pages in a PDF, or 1 for non-PDF / errors."""
     try:
         import pypdfium2 as pdfium
 
         doc = pdfium.PdfDocument(file_bytes)
-        n = len(doc)
-        doc.close()
-        return n
+        try:
+            return len(doc)
+        finally:
+            doc.close()
     except Exception as exc:
         logger.warning("Could not determine PDF page count; defaulting to 1 page: %s", exc)
         return 1

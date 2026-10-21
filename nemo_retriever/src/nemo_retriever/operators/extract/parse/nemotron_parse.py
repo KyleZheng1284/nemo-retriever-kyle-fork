@@ -6,8 +6,8 @@
 Nemotron Parse pipeline stage for native multipart and legacy contracts.
 
 Runs the Nemotron Parse model on full page images to extract structured
-document content (text, tables, charts, infographics) in a single pass,
-replacing the page-elements → OCR multi-stage pipeline.
+document content (text, tables, charts, infographics), optionally refining
+regions through the served Parse 3.5 model package.
 """
 
 from __future__ import annotations
@@ -18,6 +18,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlsplit
 
 import base64
+import hashlib
 import io
 import json
 import re
@@ -31,14 +32,22 @@ from nemo_retriever.common.modality.parse.nemotron_parse_postprocessing import (
     extract_classes_bboxes,
     postprocess_text as _postprocess_element_text,
 )
+from nemo_retriever.common.params import RemoteRetryParams
+from nemo_retriever.common.params.utils import validate_nemotron_parse_endpoint_list
+from nemo_retriever.models.nim.chat_completions import invoke_chat_completions_images
+from nemo_retriever.models.nim.nim import NIMClient, invoke_image_inference_batches
+from nemo_retriever.models.nim.parse_rendering import (
+    PAGE_PDF_COLUMN,
+    attempt_record,
+    eligible,
+    image_record,
+    is_parse35,
+    prepare_retry,
+)
 from nemo_retriever.operators.abstract_operator import AbstractOperator
 from nemo_retriever.operators.cpu_operator import CPUOperator
 from nemo_retriever.operators.gpu_operator import GPUOperator
 from nemo_retriever.operators.operator_archetype import ArchetypeOperator
-from nemo_retriever.models.nim.chat_completions import invoke_chat_completions_images
-from nemo_retriever.models.nim.nim import NIMClient, invoke_image_inference_batches
-from nemo_retriever.common.params import RemoteRetryParams
-from nemo_retriever.common.params.utils import validate_nemotron_parse_endpoint_list
 
 try:
     from PIL import Image
@@ -306,7 +315,10 @@ def nemotron_parse_pages(
     extract_tables: bool = False,
     extract_charts: bool = False,
     extract_infographics: bool = False,
-    nemotron_parse_model: Optional[str] = None,
+    nemotron_parse_model: str | None = None,
+    nemotron_parse_mode: str = "single",
+    nemotron_parse_triple_regions: str = "union",
+    nemotron_parse_rendering_retry: bool | None = None,
     task_prompt: str = NEMOTRON_PARSE_DEFAULT_TASK_PROMPT,
     remote_retry: RemoteRetryParams | None = None,
     nim_client: NIMClient | None = None,
@@ -314,7 +326,7 @@ def nemotron_parse_pages(
 ) -> Any:
     """Run Nemotron Parse on full page images.
 
-    Each page is parsed in a single model call.  The structured output is
+    The served Parse 3.5 contract optionally refines table/chart regions. The structured output is
     split by element class (Text, Table, Chart, Picture, …) and routed to
     the corresponding pipeline content columns (``table``, ``chart``,
     ``infographic``).  Non-structured elements (headings, body text, …) are
@@ -339,6 +351,27 @@ def nemotron_parse_pages(
     if not use_remote and model is None:
         raise ValueError("A local `model` is required when `invoke_url` is not provided.")
 
+    document_contract = (
+        use_remote
+        and is_parse35(nemotron_parse_model)
+        and all(
+            urlsplit(url).path.rstrip("/") == "/v1/chat/completions"
+            for url in validate_nemotron_parse_endpoint_list(invoke_url)
+        )
+    )
+    if nemotron_parse_mode not in {"single", "double", "triple"} or nemotron_parse_triple_regions not in {
+        "union",
+        "detector",
+    }:
+        raise ValueError("Invalid Nemotron Parse mode or triple_regions")
+    if (nemotron_parse_mode != "single" or nemotron_parse_triple_regions != "union") and not document_contract:
+        raise ValueError("Multipass requires served Parse 3.5 through /v1/chat/completions")
+    render_retry = document_contract if nemotron_parse_rendering_retry is None else nemotron_parse_rendering_retry
+    if render_retry and use_remote and not document_contract:
+        raise ValueError("Rendering retry supports local Parse v1.2 or served Parse 3.5 chat completions")
+    if render_retry and not use_remote and not callable(getattr(model, "invoke_batch_with_finish_reasons", None)):
+        raise ValueError("Rendering retry requires local completion finish reasons")
+
     n_rows = len(batch_df)
     all_table: List[List[Dict[str, Any]]] = [[] for _ in range(n_rows)]
     all_chart: List[List[Dict[str, Any]]] = [[] for _ in range(n_rows)]
@@ -358,20 +391,38 @@ def nemotron_parse_pages(
     t0_total = time.perf_counter()
 
     # -- Phase 1: collect page images that need inference ----------------
-    batch_indices: List[int] = []  # index into batch_df
-    batch_images: List[Any] = []  # RGB PIL images (local) or b64 strings (remote)
+    batch_indices: list[int] = []  # index into batch_df
+    batch_images: list[Any] = []  # RGB PIL images (local) or b64 strings (remote)
+    page_pdfs = []
+    identities = []
+    selected_page_images = {}
+    local_attempts = []
 
     for idx, row in enumerate(batch_df.itertuples(index=False)):
         page_image = getattr(row, "page_image", None) or {}
         page_image_b64 = page_image.get("image_b64") if isinstance(page_image, dict) else None
         if not isinstance(page_image_b64, str) or not page_image_b64:
+            all_meta[idx]["error"] = {
+                "stage": "nemotron_parse_pages_input",
+                "type": "MissingPageImage",
+                "message": "No rendered page image is available",
+            }
             continue
         try:
-            if use_remote:
-                batch_images.append(page_image_b64)
-            else:
-                batch_images.append(_decode_page_image(page_image_b64))
+            source = batch_df.iloc[idx]
+            page_pdf = source.get(PAGE_PDF_COLUMN)
+            page_pdf = bytes(page_pdf) if isinstance(page_pdf, (bytes, bytearray, memoryview)) else None
+            identity = {
+                "path": source.get("path"),
+                "source_id": source.get("source_id"),
+                "page_number": int(source["page_number"]) if pd.notna(source.get("page_number")) else None,
+                "page_pdf_sha256": hashlib.sha256(page_pdf).hexdigest() if page_pdf else None,
+            }
+            decoded = page_image_b64 if use_remote else _decode_page_image(page_image_b64)
+            batch_images.append(decoded)
             batch_indices.append(idx)
+            page_pdfs.append(page_pdf)
+            identities.append(identity)
         except Exception as e:
             all_meta[idx] = _error_payload(stage="nemotron_parse_pages_decode", exc=e)
 
@@ -433,10 +484,17 @@ def nemotron_parse_pages(
                             max_retries=int(retry.remote_max_retries),
                             max_429_retries=int(retry.remote_max_429_retries),
                             nim_client=nim_client,
+                            mode=nemotron_parse_mode,
+                            triple_regions=nemotron_parse_triple_regions,
+                            rendering_retry=render_retry,
+                            page_pdfs=page_pdfs,
+                            page_identities=identities,
                         )
                         raw_texts = [item["routing_output"] for item in documents]
                         for idx, document in zip(batch_indices, documents):
-                            all_meta[idx].update({k: v for k, v in document.items() if k != "routing_output"})
+                            if "selected_page_image" in document:
+                                selected_page_images[idx] = document["selected_page_image"]
+                            all_meta[idx].update({k: v for k, v in document.items() if k != "selected_page_image"})
                     else:
                         extra_body: Dict[str, Any] = {"max_tokens": 8192}
                         if contract.profile == _NemotronParseContractProfile.LEGACY_TOOL_CALL:
@@ -497,6 +555,20 @@ def nemotron_parse_pages(
             else:
                 # Local vLLM model (v1.2): uses task_prompt, returns tagged text.
                 invoke_with_finish_reasons = getattr(model, "invoke_batch_with_finish_reasons", None)
+                if render_retry:
+                    settings = getattr(model, "generation_settings", None)
+                    local_attempts = [
+                        attempt_record(
+                            image, attempt=0, stage="fullpage", prompt=task_prompt, settings=settings, identity=identity
+                        )
+                        for image, identity in zip(batch_images, identities, strict=True)
+                    ]
+                    for idx, record in zip(batch_indices, local_attempts, strict=True):
+                        all_meta[idx].update(
+                            attempts=[record],
+                            selected_attempt=0,
+                            rendering_retry={"enabled": True, "attempted": False, "selected": False},
+                        )
                 if callable(invoke_with_finish_reasons):
                     local_results = list(invoke_with_finish_reasons(batch_images, task_prompt=task_prompt))
                     if len(local_results) != len(batch_images):
@@ -511,7 +583,59 @@ def nemotron_parse_pages(
                         raw_texts = [str(t or "") for t in invoke_batch(batch_images, task_prompt=task_prompt)]
                     else:
                         raw_texts = [str(model.invoke(img, task_prompt=task_prompt) or "") for img in batch_images]
+                if render_retry:
+                    for pos, (idx, record) in enumerate(zip(batch_indices, local_attempts, strict=True)):
+                        record.update(
+                            raw_output=raw_texts[pos], finish_reason=local_finish_reasons[pos], ended_unix=time.time()
+                        )
+                        response = {"raw_out": raw_texts[pos], "finish_reason": local_finish_reasons[pos]}
+                        if not eligible(response):
+                            continue
+                        candidate = None
+                        try:
+                            candidate, reason = prepare_retry(batch_images[pos], page_pdfs[pos], parse35=False)
+                            all_meta[idx]["rendering_retry"]["reason"] = reason
+                            if candidate is None:
+                                continue
+                            followup = attempt_record(
+                                candidate,
+                                attempt=1,
+                                stage="fullpage",
+                                prompt=task_prompt,
+                                settings=record["settings"],
+                                identity=identities[pos],
+                            )
+                            all_meta[idx]["attempts"].append(followup)
+                            all_meta[idx]["rendering_retry"]["attempted"] = True
+                            try:
+                                completions = list(invoke_with_finish_reasons([candidate], task_prompt=task_prompt))
+                                if len(completions) != 1:
+                                    raise RuntimeError("Expected one rendering-retry completion")
+                                text, finish = completions[0]
+                                followup.update(raw_output=text, finish_reason=finish)
+                            except Exception as exc:
+                                followup["error"] = {"type": type(exc).__name__, "message": str(exc)}
+                                raise
+                            finally:
+                                followup["ended_unix"] = time.time()
+                            if finish == "stop" and str(text or "").strip():
+                                raw_texts[pos], local_finish_reasons[pos] = str(text), finish
+                                all_meta[idx]["selected_attempt"] = 1
+                                all_meta[idx]["rendering_retry"]["selected"] = True
+                                selected_page_images[idx] = image_record(candidate)
+                        except Exception as exc:
+                            all_meta[idx]["error"] = {
+                                "stage": "nemotron_parse_pages_rendering_retry",
+                                "type": type(exc).__name__,
+                                "message": str(exc),
+                            }
+                        finally:
+                            if candidate is not None:
+                                candidate.close()
         except BaseException as e:
+            for record in local_attempts:
+                if record["ended_unix"] is None:
+                    record.update(ended_unix=time.time(), error={"type": type(e).__name__, "message": str(e)})
             if (
                 contract is not None
                 and nemotron_parse_model
@@ -548,6 +672,8 @@ def nemotron_parse_pages(
         idx = batch_indices[pos]
         if all_meta[idx]["raw_output"] is None:
             all_meta[idx]["raw_output"] = raw_text
+        if local_finish_reasons[pos] is not None:
+            all_meta[idx]["finish_reason"] = local_finish_reasons[pos]
         if all_meta[idx]["error"] is not None:
             continue
         try:
@@ -571,6 +697,12 @@ def nemotron_parse_pages(
                 all_text[idx] = fp_text
             finish_reason = local_finish_reasons[pos] or all_meta[idx].get("finish_reason")
             all_meta[idx]["finish_reason"] = finish_reason
+            if not raw_text.strip() and finish_reason == "stop":
+                all_meta[idx]["error"] = {
+                    "stage": "nemotron_parse_pages_finish_reason",
+                    "type": "EmptyModelOutputError",
+                    "message": "Nemotron Parse returned empty completed output",
+                }
             if not native_parse and finish_reason is not None and finish_reason.lower() not in {"stop", "eos"}:
                 all_meta[idx]["error"] = {
                     "stage": "nemotron_parse_pages_finish_reason",
@@ -590,7 +722,12 @@ def nemotron_parse_pages(
     for meta in all_meta:
         meta["timing"] = {"seconds": float(elapsed)}
 
-    out = batch_df.copy()
+    out = batch_df.drop(columns=[PAGE_PDF_COLUMN], errors="ignore").copy()
+    for idx, selected_image in selected_page_images.items():
+        out.iat[idx, out.columns.get_loc("page_image")] = selected_image
+    for image in batch_images:
+        if isinstance(image, Image.Image):
+            image.close()
     if extract_text and "text" in out.columns:
         for i, parse_text in enumerate(all_text):
             if parse_text is not None:
@@ -629,10 +766,13 @@ class NemotronParseGPUActor(AbstractOperator, GPUOperator):
         extract_tables: bool = False,
         extract_charts: bool = False,
         extract_infographics: bool = False,
-        nemotron_parse_invoke_url: Optional[str] = None,
-        nemotron_parse_model: Optional[str] = None,
-        invoke_url: Optional[str] = None,
-        api_key: Optional[str] = None,
+        nemotron_parse_invoke_url: str | None = None,
+        nemotron_parse_model: str | None = None,
+        nemotron_parse_mode: str = "single",
+        nemotron_parse_triple_regions: str = "union",
+        nemotron_parse_rendering_retry: bool | None = None,
+        invoke_url: str | None = None,
+        api_key: str | None = None,
         request_timeout_s: float = 120.0,
         task_prompt: str = NEMOTRON_PARSE_DEFAULT_TASK_PROMPT,
         remote_max_pool_workers: int = 16,
@@ -645,6 +785,11 @@ class NemotronParseGPUActor(AbstractOperator, GPUOperator):
         self._async_engine = bool(async_engine)
         self._invoke_url = str(nemotron_parse_invoke_url or "").strip() or str(invoke_url or "").strip()
         self._nemotron_parse_model = nemotron_parse_model
+        self._parse_options = dict(
+            nemotron_parse_mode=nemotron_parse_mode,
+            nemotron_parse_triple_regions=nemotron_parse_triple_regions,
+            nemotron_parse_rendering_retry=nemotron_parse_rendering_retry,
+        )
         validate_nemotron_parse_endpoint_list(self._invoke_url)
         self._api_key = api_key
         self._request_timeout_s = float(request_timeout_s)
@@ -722,7 +867,7 @@ class NemotronParseGPUActor(AbstractOperator, GPUOperator):
             extract_infographics=self._extract_infographics,
             remote_retry=self._remote_retry,
             nim_client=self._nim_client,
-            **kwargs,
+            **{**self._parse_options, **kwargs},
         )
 
     def postprocess(self, data: Any, **kwargs: Any) -> Any:
@@ -733,7 +878,7 @@ class NemotronParseGPUActor(AbstractOperator, GPUOperator):
             return self.run(batch_df, **override_kwargs)
         except BaseException as e:
             if isinstance(batch_df, pd.DataFrame):
-                out = batch_df.copy()
+                out = batch_df.drop(columns=[PAGE_PDF_COLUMN], errors="ignore").copy()
                 payload = _error_payload(stage="nemotron_parse_actor_call", exc=e)
                 n = len(out.index)
                 out["table"] = [[] for _ in range(n)]
@@ -763,10 +908,13 @@ class NemotronParseCPUActor(AbstractOperator, CPUOperator):
         extract_tables: bool = False,
         extract_charts: bool = False,
         extract_infographics: bool = False,
-        nemotron_parse_invoke_url: Optional[str] = None,
-        nemotron_parse_model: Optional[str] = None,
-        invoke_url: Optional[str] = None,
-        api_key: Optional[str] = None,
+        nemotron_parse_invoke_url: str | None = None,
+        nemotron_parse_model: str | None = None,
+        nemotron_parse_mode: str = "single",
+        nemotron_parse_triple_regions: str = "union",
+        nemotron_parse_rendering_retry: bool | None = None,
+        invoke_url: str | None = None,
+        api_key: str | None = None,
         request_timeout_s: float = 120.0,
         task_prompt: str = NEMOTRON_PARSE_DEFAULT_TASK_PROMPT,
         remote_max_pool_workers: int = 16,
@@ -779,6 +927,11 @@ class NemotronParseCPUActor(AbstractOperator, CPUOperator):
             str(nemotron_parse_invoke_url or "").strip() or str(invoke_url or "").strip() or self.DEFAULT_INVOKE_URL
         )
         self._nemotron_parse_model = nemotron_parse_model
+        self._parse_options = dict(
+            nemotron_parse_mode=nemotron_parse_mode,
+            nemotron_parse_triple_regions=nemotron_parse_triple_regions,
+            nemotron_parse_rendering_retry=nemotron_parse_rendering_retry,
+        )
         validate_nemotron_parse_endpoint_list(self._invoke_url)
         self._api_key = api_key
         self._request_timeout_s = float(request_timeout_s)
@@ -813,7 +966,7 @@ class NemotronParseCPUActor(AbstractOperator, CPUOperator):
             extract_infographics=self._extract_infographics,
             remote_retry=self._remote_retry,
             nim_client=self._nim_client,
-            **kwargs,
+            **{**self._parse_options, **kwargs},
         )
 
     def postprocess(self, data: Any, **kwargs: Any) -> Any:
@@ -824,7 +977,7 @@ class NemotronParseCPUActor(AbstractOperator, CPUOperator):
             return self.run(batch_df, **override_kwargs)
         except BaseException as e:
             if isinstance(batch_df, pd.DataFrame):
-                out = batch_df.copy()
+                out = batch_df.drop(columns=[PAGE_PDF_COLUMN], errors="ignore").copy()
                 payload = _error_payload(stage="nemotron_parse_actor_call", exc=e)
                 n = len(out.index)
                 out["table"] = [[] for _ in range(n)]
