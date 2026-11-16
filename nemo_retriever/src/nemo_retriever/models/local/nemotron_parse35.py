@@ -276,17 +276,8 @@ class NemotronParse35(BaseModel):
             self._ensure_model()
             if self._backend == "vllm":
                 prompt = task_prompt if task_prompt is not None else self._task_prompt
-                generated = self._model.generate(
-                    [
-                        {
-                            "prompt": "<pad>" + prompt,
-                            "multi_modal_data": {"image": page},
-                        }
-                    ],
-                    self._generation_config,
-                    tokenization_kwargs={"add_special_tokens": False},
-                )
-                outputs.append(generated[0].outputs[0].text.strip())
+                generated = self._generate_vllm(page, prompt, self._generation_config)
+                outputs.append(generated.text.strip())
                 continue
             features = self._processor(
                 images=[page],
@@ -298,6 +289,42 @@ class NemotronParse35(BaseModel):
                 sequences = self._model.generate(**features, generation_config=self._generation_config)
             outputs.append(self._processor.batch_decode(sequences, skip_special_tokens=False)[0].strip())
         return outputs
+
+    def _generate_vllm(self, page: Image.Image, prompt: str, sampling: Any) -> Any:
+        """Share the existing plugin/native request contract across generation entry points."""
+        generated = self._model.generate(
+            [
+                {
+                    "prompt": "<pad>" + prompt,
+                    "multi_modal_data": {"image": page},
+                }
+            ],
+            sampling,
+            tokenization_kwargs={"add_special_tokens": False},
+        )
+        return generated[0].outputs[0]
+
+    def invoke_response(
+        self, input_data: ImageInput, *, task_prompt: str, sampling_params: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Generate one multi-pass stage with independent settings and completion status.
+
+        Only vLLM is supported. The actor's default settings remain unchanged;
+        callers must inspect finish_reason before using potentially partial text.
+        """
+        if self._backend != "vllm":
+            raise ValueError("Multi-pass Parse requires the local vLLM backend.")
+        page = self.preprocess(input_data)
+        self._ensure_model()
+        from vllm import SamplingParams
+
+        sampling = SamplingParams(**sampling_params, skip_special_tokens=False)
+        output = self._generate_vllm(page, task_prompt, sampling)
+        return {
+            "raw_out": output.text.strip(),
+            "finish_reason": output.finish_reason,
+            "usage": {"completion_tokens": len(output.token_ids)},
+        }
 
     def __call__(self, input_data: ImageInput, task_prompt: str | None = None) -> str:
         """Generate tagged text for a single page, delegating to :meth:`invoke`.
