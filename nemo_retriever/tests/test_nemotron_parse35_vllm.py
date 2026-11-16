@@ -352,3 +352,46 @@ def test_native_sampling_overrides_are_independent_of_draft_length(native_runtim
 def test_native_invalid_draft_length_is_rejected(tokens):
     with pytest.raises(ValueError, match="must be 8, 16, or 32"):
         NemotronParse35(num_speculative_tokens=tokens)
+
+
+@pytest.mark.parametrize("native", [False, True])
+def test_stage_response_preserves_finish_reason_and_default_settings(vllm_runtime, native):
+    vllm_runtime.sampling.side_effect = lambda **kwargs: SimpleNamespace(**kwargs)
+    parser = NemotronParse35()
+    page = Image.new("RGB", (16, 20))
+    parser.invoke(page)
+    original_config = parser._generation_config
+    parser._use_dflash = native
+    vllm_runtime.engine.generate.return_value = [
+        SimpleNamespace(outputs=[SimpleNamespace(text=" partial ", finish_reason="length", token_ids=[1, 2, 3])])
+    ]
+    response = parser.invoke_response(
+        page,
+        task_prompt="detection",
+        sampling_params={
+            "temperature": 0.2,
+            "repetition_penalty": 1.05,
+            "max_tokens": 4096,
+            "top_k": 50,
+            "top_p": 1.0,
+            "seed": 0,
+        },
+    )
+    assert response == {"raw_out": "partial", "finish_reason": "length", "usage": {"completion_tokens": 3}}
+    request = vllm_runtime.engine.generate.call_args.args[0][0]
+    assert request["prompt"] == ("<pad>" if native else "<pad>\n") + "detection"
+    assert vllm_runtime.sampling.call_args.kwargs["max_tokens"] == 4096
+    assert vllm_runtime.sampling.call_args.kwargs["skip_special_tokens"] is False
+    assert parser._generation_config is original_config
+    assert original_config.max_tokens == 9000
+    assert vllm_runtime.engine.generate.call_args.args[1].max_tokens == 4096
+    parser.invoke(page)
+    assert vllm_runtime.engine.generate.call_args.args[1] is original_config
+    assert vllm_runtime.llm.call_count == 1
+
+
+def test_stage_response_rejects_transformers_without_loading(vllm_runtime):
+    parser = NemotronParse35(backend="transformers", device="cpu")
+    with pytest.raises(ValueError, match="local vLLM backend"):
+        parser.invoke_response(Image.new("RGB", (16, 20)), task_prompt="p", sampling_params={})
+    vllm_runtime.download.assert_not_called()

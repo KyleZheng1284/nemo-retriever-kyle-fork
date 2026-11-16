@@ -188,7 +188,8 @@ def test_local_crop_actor_uses_crop_defaults_and_overrides():
 
 
 @pytest.mark.parametrize("mode", ["pdf", "image"])
-def test_mixed_input_parse_path_renders_and_forwards_group(monkeypatch, mode):
+@pytest.mark.parametrize("parse_mode", ["single", "double", "triple"])
+def test_mixed_input_parse_path_renders_and_forwards_group(monkeypatch, mode, parse_mode):
     from nemo_retriever.operators.graph_ops import multi_type_extract_operator as module
 
     events, received = [], []
@@ -208,7 +209,7 @@ def test_mixed_input_parse_path_renders_and_forwards_group(monkeypatch, mode):
         extraction_mode=mode,
         extract_params=ExtractParams(
             method="nemotron_parse",
-            parse=config(table_format="HTML", **SAMPLING),
+            parse=config(table_format="HTML", mode=parse_mode, **SAMPLING),
         ),
     )
 
@@ -226,6 +227,7 @@ def test_mixed_input_parse_path_renders_and_forwards_group(monkeypatch, mode):
     )
     assert received[0]["parse_sampling_params"] == SAMPLING
     assert received[0]["nemotron_parse_table_format"] == "HTML"
+    assert received[0].get("parse_mode", "single") == parse_mode
 
 
 @pytest.mark.parametrize("routing", [False, True])
@@ -270,3 +272,43 @@ def test_parse_configuration_schema_describes_all_fields():
     assert "chart crops" in schema["properties"]["max_tokens"]["description"]
     restored = ParseParams.model_validate({"table_format": "simple_html", "top_k": 50})
     assert restored.table_format == "simple_html" and restored.top_k == 50
+
+
+@pytest.mark.parametrize("mode", ["double", "triple"])
+def test_multipass_mode_round_trip_and_graph_wiring(mode):
+    params = ExtractParams(method="nemotron_parse", parse=config(mode=mode))
+    restored = ExtractParams.model_validate_json(params.model_dump_json())
+    assert restored.parse.mode == mode
+    graph = build_graph(extraction_mode="pdf", extract_params=restored)
+    assert get_node_kwargs(graph, "NemotronParseActor")["parse_mode"] == mode
+
+
+@pytest.mark.parametrize(
+    "group,extract",
+    [
+        ({"mode": "quadruple"}, {}),
+        ({"mode": "double", "model": NEMOTRON_PARSE_V12_MODEL}, {}),
+        ({"mode": "double", "invoke_url": URL}, {}),
+        ({"mode": "triple", "model": NEMOTRON_PARSE35_MODEL, "invoke_url": "http://local/v1/parse"}, {}),
+        (
+            {
+                "mode": "triple",
+                "model": NEMOTRON_PARSE35_MODEL,
+                "invoke_url": "https://integrate.api.nvidia.com/v1/chat/completions",
+            },
+            {},
+        ),
+        ({"mode": "double"}, {"method": "ocr", "chart_routing": True}),
+    ],
+)
+def test_invalid_multipass_configuration_fails_early(group, extract):
+    with pytest.raises(ValueError):
+        ExtractParams(**{"method": "nemotron_parse", **extract}, parse=ParseParams(**group))
+
+
+def test_single_mode_preserves_existing_actor_configuration():
+    assert ParseParams().mode == "single"
+    implicit = ExtractParams(method="nemotron_parse", parse=ParseParams())
+    explicit = ExtractParams(method="nemotron_parse", parse=ParseParams(mode="single"))
+    assert implicit._parse_actor_overrides() == explicit._parse_actor_overrides()
+    assert "parse_mode" not in explicit._parse_actor_overrides()
