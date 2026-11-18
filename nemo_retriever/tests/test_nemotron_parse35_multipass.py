@@ -300,13 +300,19 @@ def test_cached_hf_rejects_incomplete_generations(cached_helpers, response):
 
 
 @pytest.mark.parametrize("actor_class", [operator.NemotronParseCPUActor, operator.NemotronParseGPUActor])
-def test_actor_forwards_mode_to_page_processing(monkeypatch, actor_class):
+@pytest.mark.parametrize("mode", ["double", "triple"])
+def test_rebuilt_actor_forwards_mode_to_page_processing(monkeypatch, actor_class, mode):
+    from nemo_retriever.graph.pipeline_graph import Node
+
     process = Mock(return_value=frame())
     monkeypatch.setattr(operator, "nemotron_parse_pages", process)
-    actor = actor_class(nemotron_parse_model=NEMOTRON_PARSE35_MODEL, nemotron_parse_invoke_url=URL, parse_mode="double")
-    actor.process(frame())
-    assert process.call_args.kwargs["parse_mode"] == "double"
+    actor = actor_class(nemotron_parse_model=NEMOTRON_PARSE35_MODEL, nemotron_parse_invoke_url=URL, parse_mode=mode)
+    node = Node(actor)
+    rebuilt = node.operator_class(**node.operator_kwargs)
+    rebuilt.process(frame())
+    assert process.call_args.kwargs["parse_mode"] == mode
     assert process.call_args.kwargs["nemotron_parse_model"] == NEMOTRON_PARSE35_MODEL
+    assert process.call_args.kwargs["task_prompt"] is None
 
 
 def test_remote_callback_propagates_caller_context(hf, monkeypatch):

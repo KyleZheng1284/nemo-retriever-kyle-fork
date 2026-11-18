@@ -384,11 +384,24 @@ class NemotronParse35(BaseModel):
     ) -> dict[str, Any]:
         """Generate one multi-pass stage with independent settings and completion status.
 
-        The shared asynchronous engine can schedule this call alongside other
-        pages, while the actor's configured single-pass settings stay unchanged.
+        Args:
+            input_data: Page image in a format accepted by :meth:`preprocess`.
+            task_prompt: Native control tokens for this stage.
+            sampling_params: vLLM sampling settings for this request. Special tokens
+                are always retained, so omit `skip_special_tokens`.
+
+        Returns:
+            A dictionary with tagged text in `raw_out`, the vLLM `finish_reason`,
+            and `usage` containing the number of `completion_tokens`.
+
+        Raises:
+            TypeError: If the image type or sampling arguments are unsupported.
+            ValueError: If the backend is not vLLM or image or sampling values are invalid.
+            OSError: If image or checkpoint assets cannot be loaded.
+            RuntimeError: If model loading or generation fails.
         """
         if self._backend != "vllm":
-            raise ValueError("Multi-pass Parse requires the local vLLM backend.")
+            raise ValueError("Multi-pass Parse requires the local vLLM backend. Set backend='vllm'.")
         page = self.preprocess(input_data)
         self._ensure_model()
         from vllm import SamplingParams

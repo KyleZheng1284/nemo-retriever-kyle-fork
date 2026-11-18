@@ -876,7 +876,7 @@ class NemotronParseGPUActor(AbstractOperator, GPUOperator):
         self._parse_mode = parse_mode
         selected_model = nemotron_parse_model or (NEMOTRON_PARSE_LOCAL_DEFAULT_MODEL if not self._invoke_url else None)
         _validate_parse_mode(parse_mode, selected_model, self._invoke_url, task_prompt)
-        self._task_prompt = task_prompt if task_prompt is not None else NEMOTRON_PARSE_DEFAULT_TASK_PROMPT
+        self._task_prompt = task_prompt
         self._remote_retry = RemoteRetryParams(
             remote_max_pool_workers=int(remote_max_pool_workers),
             remote_max_retries=int(remote_max_retries),
@@ -914,7 +914,10 @@ class NemotronParseGPUActor(AbstractOperator, GPUOperator):
             )
         from nemo_retriever.models.local import NemotronParse35
 
-        model_kwargs: Dict[str, Any] = {"task_prompt": self._task_prompt, "backend": "vllm"}
+        model_kwargs: Dict[str, Any] = {
+            "task_prompt": self._task_prompt if self._task_prompt is not None else NEMOTRON_PARSE_DEFAULT_TASK_PROMPT,
+            "backend": "vllm",
+        }
         model_kwargs["dflash_tokens"] = self._nemotron_parse_dflash_tokens
         if self._parse_sampling_params:
             model_kwargs["sampling_params"] = {
@@ -936,7 +939,7 @@ class NemotronParseGPUActor(AbstractOperator, GPUOperator):
             parse_mode=self._parse_mode,
             api_key=self._api_key,
             request_timeout_s=self._request_timeout_s,
-            task_prompt=self._task_prompt if self._parse_mode == "single" else None,
+            task_prompt=self._task_prompt,
             extract_text=self._extract_text,
             extract_tables=self._extract_tables,
             extract_charts=self._extract_charts,
@@ -1019,7 +1022,7 @@ class NemotronParseCPUActor(AbstractOperator, CPUOperator):
         self._parse_mode = parse_mode
         selected_model = nemotron_parse_model or (NEMOTRON_PARSE_LOCAL_DEFAULT_MODEL if not self._invoke_url else None)
         _validate_parse_mode(parse_mode, selected_model, self._invoke_url, task_prompt)
-        self._task_prompt = task_prompt if task_prompt is not None else NEMOTRON_PARSE_DEFAULT_TASK_PROMPT
+        self._task_prompt = task_prompt
         self._remote_retry = RemoteRetryParams(
             remote_max_pool_workers=int(remote_max_pool_workers),
             remote_max_retries=int(remote_max_retries),
@@ -1046,7 +1049,7 @@ class NemotronParseCPUActor(AbstractOperator, CPUOperator):
             parse_mode=self._parse_mode,
             api_key=self._api_key,
             request_timeout_s=self._request_timeout_s,
-            task_prompt=self._task_prompt if self._parse_mode == "single" else None,
+            task_prompt=self._task_prompt,
             extract_text=self._extract_text,
             extract_tables=self._extract_tables,
             extract_charts=self._extract_charts,

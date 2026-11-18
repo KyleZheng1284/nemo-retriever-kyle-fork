@@ -82,7 +82,21 @@ def validate_nemotron_parse_endpoint_list(invoke_url: str | None) -> tuple[str, 
 
 
 def validate_nemotron_parse_mode(mode: str, *, model: str | None, invoke_url: str | None) -> None:
-    """Validate multi-pass model and transport support before inference or graph construction."""
+    """Validate that the selected Parse mode supports the model and transport.
+
+    Args:
+        mode: One of `single`, `double`, or `triple`.
+        model: Model ID. For local multi-pass, `None` selects Parse 3.5.
+        invoke_url: Remote endpoint or comma-separated endpoint list.
+            An empty value selects local inference.
+
+    Returns:
+        None if the configuration is supported.
+
+    Raises:
+        ValueError: If the mode is unknown or the model or endpoints are
+            incompatible with multi-pass inference.
+    """
     if mode not in ("single", "double", "triple"):
         raise ValueError("Parse mode must be single, double, or triple.")
     if mode == "single":
