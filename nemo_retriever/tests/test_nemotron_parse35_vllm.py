@@ -518,3 +518,44 @@ def test_async_engine_keeps_prompt_order_and_propagates_failures(monkeypatch: py
 def test_vllm_validates_blank_pages(vllm_runtime: SimpleNamespace) -> None:
     with pytest.raises(ValueError):
         NemotronParse35().invoke_batch([np.zeros((16, 16, 2, 2), dtype=np.uint8)])
+
+
+def test_stage_response_preserves_finish_reason_and_default_settings(vllm_runtime):
+    vllm_runtime.sampling.side_effect = lambda **kwargs: SimpleNamespace(**kwargs)
+    parser = NemotronParse35()
+    page = Image.new("RGB", (16, 20))
+    parser.invoke(page)
+    original_config = parser._generation_config
+    vllm_runtime.engine.generate.return_value = [
+        SimpleNamespace(outputs=[SimpleNamespace(text=" partial ", finish_reason="length", token_ids=[1, 2, 3])])
+    ]
+    response = parser.invoke_response(
+        page,
+        task_prompt="detection",
+        sampling_params={
+            "temperature": 0.2,
+            "repetition_penalty": 1.05,
+            "max_tokens": 4096,
+            "top_k": 50,
+            "top_p": 1.0,
+            "seed": 0,
+        },
+    )
+    assert response == {"raw_out": "partial", "finish_reason": "length", "usage": {"completion_tokens": 3}}
+    request = vllm_runtime.engine.generate.call_args.args[0][0]
+    assert request["prompt"] == "<pad>detection"
+    assert vllm_runtime.sampling.call_args.kwargs["max_tokens"] == 4096
+    assert vllm_runtime.sampling.call_args.kwargs["skip_special_tokens"] is False
+    assert parser._generation_config is original_config
+    assert original_config.max_tokens == 9000
+    assert vllm_runtime.engine.generate.call_args.args[1].max_tokens == 4096
+    parser.invoke(page)
+    assert vllm_runtime.engine.generate.call_args.args[1] is original_config
+    assert vllm_runtime.llm.call_count == 1
+
+
+def test_stage_response_rejects_transformers_without_loading(vllm_runtime):
+    parser = NemotronParse35(backend="transformers", device="cpu")
+    with pytest.raises(ValueError, match="local vLLM backend"):
+        parser.invoke_response(Image.new("RGB", (16, 20)), task_prompt="p", sampling_params={})
+    vllm_runtime.download.assert_not_called()
