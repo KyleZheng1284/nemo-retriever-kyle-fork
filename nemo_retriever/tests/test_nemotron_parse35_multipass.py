@@ -5,6 +5,7 @@
 """Multi-pass adapter contracts without model weights or network access."""
 
 import base64
+from copy import deepcopy
 from dataclasses import dataclass
 import io
 from types import SimpleNamespace
@@ -155,19 +156,21 @@ def frame(count=1):
 @pytest.mark.parametrize("mode", ["double", "triple"])
 @pytest.mark.parametrize("model_name", [NEMOTRON_PARSE35_MODEL, "Nemotron-3.5-Parse"])
 def test_pipeline_routes_merged_content_and_records_metadata(monkeypatch, mode, model_name):
-    multipass = Mock(return_value=[{"raw_out": RAW, "inference": {"mode": mode, "requests": 3, "sampling": {}}}])
-    monkeypatch.setattr(operator, "_parse35_multipass", multipass)
-    monkeypatch.setattr(
-        postprocessing,
-        "_postprocess_parse35_blocks",
-        lambda raw, **kw: [
+    document = {
+        "raw_out": RAW,
+        "inference": {"mode": mode, "requests": 3, "sampling": {}},
+        "blocks": [
             {"class": "Text", "bbox": [0, 0, 1, 0.1], "content": "merged heading"},
             {"class": "Table", "bbox": [0.1, 0.2, 0.9, 0.8], "content": "merged table"},
         ],
-    )
+    }
+    monkeypatch.setattr(operator, "_parse35_multipass", Mock(return_value=[document]))
+    render = Mock(side_effect=AssertionError("Merged output has already been rendered"))
+    monkeypatch.setattr(postprocessing, "_load_parse35_helpers", lambda: SimpleNamespace(postprocess_document=render))
     output = operator.nemotron_parse_pages(
         frame(), model=Mock(model_name=model_name), parse_mode=mode, extract_text=True, extract_tables=True
     )
+    render.assert_not_called()
     assert output.iloc[0]["text"] == "merged heading"
     assert output.iloc[0]["table"][0]["text"] == "merged table"
     assert output.iloc[0]["ordered_page_text"] == "merged heading\n\nmerged table"
@@ -278,6 +281,13 @@ def test_cached_hf_parity(cached_helpers, monkeypatch, mode, structural, remote)
     assert calls == expected_calls
     assert actual["raw_out"] == expected["raw_out"]
     assert actual["blocks"] == expected["blocks"]
+    for table_format in ("HTML", "simple_html", "markdown", "latex"):
+        opts = dict(
+            extract_tables=True, extract_charts=True, extract_infographics=True, parse35=True, table_format=table_format
+        )
+        assert operator._route_parsed_elements(actual["raw_out"], parse35_document=deepcopy(actual), **opts) == (
+            operator._route_parsed_elements(actual["raw_out"], **opts)
+        )
     assert actual["inference"]["requests"] == (1 + (mode == "triple") + (1 + (mode == "triple") if structural else 0))
     assert actual["inference"]["merge_policy"] == "alternatives"
 

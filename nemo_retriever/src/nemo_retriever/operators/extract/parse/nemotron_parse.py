@@ -166,6 +166,7 @@ def _route_parsed_elements(
     extract_charts: bool,
     extract_infographics: bool,
     parse35: bool = False,
+    parse35_document: dict[str, Any] | None = None,
     table_format: Optional[str] = None,
     ordered_regions: Optional[List[Dict[str, Any]]] = None,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]], Optional[str]]:
@@ -181,7 +182,9 @@ def _route_parsed_elements(
 
         elements = [
             (block["class"], block["bbox"], block["content"])
-            for block in _postprocess_parse35_blocks(raw_text, table_format=table_format or "HTML")
+            for block in _postprocess_parse35_blocks(
+                raw_text, table_format=table_format or "HTML", document=parse35_document
+            )
         ]
     else:
         classes, bboxes, texts = extract_classes_bboxes(raw_text)
@@ -575,6 +578,7 @@ def nemotron_parse_pages(
     uses_tool_call_routing = False
     contract: _ResolvedNemotronParseContract | None = None
     native_parse = False
+    documents: list[dict[str, Any]] = []
     if batch_images:
         try:
             if parse_mode != "single":
@@ -758,6 +762,7 @@ def nemotron_parse_pages(
             route_kwargs = (
                 {
                     "parse35": parse35,
+                    "parse35_document": documents[pos] if documents else None,
                     "table_format": nemotron_parse_table_format,
                     "ordered_regions": ordered_regions if parse35 else None,
                 }
