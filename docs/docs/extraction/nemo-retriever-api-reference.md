@@ -143,9 +143,11 @@ as scanned. It also runs page-element detection and OCR for text-only
 configurations, and it OCRs image inputs. To use native PDF text only, set
 `method="pdfium"`.
 
-The `audio` value remains available for the legacy params-driven audio path. For
-new audio pipelines, use [`GraphIngestor.extract_audio()`](#graph-ingestor)
-instead.
+The `method` value selects how PDF pages are read. The `extract_tables`,
+`extract_charts`, and `extract_infographics` settings choose which structured
+content types to extract. With `nemotron_parse`, Nemotron Parse extracts the
+enabled content types in place of page-element detection and OCR. For audio inputs, use
+[`GraphIngestor.extract_audio()`](#graph-ingestor).
 
 Any other value raises a Pydantic `ValidationError` before pipeline setup. The
 error lists the supported values, so spelling and configuration errors do not
@@ -501,7 +503,9 @@ Set `chart_routing=True` with `method="ocr"` or `"pdfium_hybrid"` to replace
 chart-region OCR content with Parse 3.5 output. The default is `False`.
 Routing requires `use_page_elements=True`, `extract_charts=True`, and
 `extract_page_as_image=True`. Local routing requires a CUDA GPU and the Parse
-dependencies. Remote routing requires a Parse 3.5 chat-completions endpoint.
+dependencies. Local routing uses the same Parse engine as full-page Parse, with
+a fixed 24 GiB KV cache, so each routing GPU needs more than 24 GiB of free
+memory. Remote routing requires a Parse 3.5 chat-completions endpoint.
 
 The following example runs OCR and then routes detected chart crops locally.
 Use the same `__main__` guard as the full-page example in standalone scripts.

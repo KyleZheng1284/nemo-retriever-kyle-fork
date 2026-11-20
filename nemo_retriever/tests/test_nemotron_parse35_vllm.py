@@ -424,6 +424,7 @@ def test_vllm_engine_batches_pages_with_bounded_memory(vllm_runtime: SimpleNames
     assert engine["max_num_seqs"] == NemotronParse35().input_batch_size == 128
     assert engine["gpu_memory_utilization"] == 0.3
     assert engine["kv_cache_memory_bytes"] == 24 * 1024**3
+    assert engine["mm_processor_cache_gb"] == 0
     assert NemotronParse35(backend="transformers", device="cpu").input_batch_size == 1
 
 
@@ -457,7 +458,7 @@ def test_concurrent_callers_load_one_engine(vllm_runtime: SimpleNamespace) -> No
     vllm_runtime.llm.assert_called_once()
 
 
-@pytest.mark.parametrize("mode", ["normal", "empty", "error"])
+@pytest.mark.parametrize("mode", ["normal", "empty", "error", "abort", "error_finish", "return_abort"])
 def test_async_engine_keeps_prompt_order_and_propagates_failures(monkeypatch: pytest.MonkeyPatch, mode: str) -> None:
     preprocess = ModuleType("vllm.renderers.inputs.preprocess")
     preprocess.parse_model_prompt = lambda config, prompt: prompt
@@ -482,7 +483,10 @@ def test_async_engine_keeps_prompt_order_and_propagates_failures(monkeypatch: py
         if mode == "empty":
             return
         await asyncio.sleep(0.01 if item == "first" else 0)
-        yield item
+        reason = "error" if mode == "error_finish" and item == "second" else "stop"
+        yield SimpleNamespace(
+            outputs=[SimpleNamespace(finish_reason="abort" if mode in ("abort", "return_abort") else reason)], item=item
+        )
 
     engine = adapter_module._AsyncParseEngine.__new__(adapter_module._AsyncParseEngine)
     engine._loop = asyncio.new_event_loop()
@@ -502,15 +506,56 @@ def test_async_engine_keeps_prompt_order_and_propagates_failures(monkeypatch: py
     params = SimpleNamespace(clone=SimpleNamespace)
     try:
         if mode == "normal":
-            assert engine.generate(["first", "second"], params) == ["first", "second"]
+            assert [output.item for output in engine.generate(["first", "second"], params)] == ["first", "second"]
             assert len(set(request_ids)) == 2
+        elif mode == "return_abort":
+            [output] = engine.generate(["first"], params, raise_on_failed_finish=False)
+            assert output.outputs[0].finish_reason == "abort"
         else:
-            with pytest.raises(RuntimeError, match="no output" if mode == "empty" else "request failed"):
+            expected = {"empty": "no output", "error": "request failed"}.get(mode, "finished with reason")
+            with pytest.raises(RuntimeError, match=expected):
                 engine.generate(["first", "second"], params)
             assert cancelled == (["second"] if mode == "error" else [])
+        unwound = []
+
+        async def output_handler() -> None:
+            try:
+                await asyncio.sleep(30)
+            except asyncio.CancelledError:
+                await asyncio.sleep(0)
+                unwound.append(True)
+                raise
+
+        handler = asyncio.run_coroutine_threadsafe(output_handler(), engine._loop)
+        # Like vLLM, engine shutdown only schedules the handler's cancellation on the loop.
+        engine.engine.shutdown.side_effect = lambda timeout: handler.cancel()
     finally:
         engine.shutdown(timeout=30)
     engine.engine.shutdown.assert_called_once_with(timeout=30)
+    assert unwound == [True]
+    assert engine._loop.is_closed()
+    assert not engine._thread.is_alive()
+
+
+def test_async_engine_shutdown_does_not_wait_past_timeout_for_stuck_tasks() -> None:
+    engine = adapter_module._AsyncParseEngine.__new__(adapter_module._AsyncParseEngine)
+    engine._loop = asyncio.new_event_loop()
+    engine._thread = threading.Thread(target=engine._loop.run_forever, daemon=True)
+    engine._thread.start()
+    engine.engine = SimpleNamespace(shutdown=MagicMock())
+
+    async def ignores_cancellation() -> None:
+        while True:
+            try:
+                await asyncio.sleep(30)
+            except asyncio.CancelledError:
+                pass
+
+    asyncio.run_coroutine_threadsafe(ignores_cancellation(), engine._loop)
+    shutdown = threading.Thread(target=engine.shutdown, kwargs={"timeout": 0.1}, daemon=True)
+    shutdown.start()
+    shutdown.join(timeout=5)
+    assert not shutdown.is_alive()
     assert engine._loop.is_closed()
     assert not engine._thread.is_alive()
 
@@ -542,6 +587,7 @@ def test_stage_response_preserves_finish_reason_and_default_settings(vllm_runtim
         },
     )
     assert response == {"raw_out": "partial", "finish_reason": "length", "usage": {"completion_tokens": 3}}
+    assert vllm_runtime.engine.generate.call_args.kwargs["raise_on_failed_finish"] is False
     request = vllm_runtime.engine.generate.call_args.args[0][0]
     assert request["prompt"] == "<pad>detection"
     assert vllm_runtime.sampling.call_args.kwargs["max_tokens"] == 4096

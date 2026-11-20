@@ -231,6 +231,8 @@ class NemotronParse35(BaseModel):
                 attention_config={"flash_attn_version": 3},
                 gpu_memory_utilization=0.3,
                 kv_cache_memory_bytes=24 * 1024**3,
+                # UDF threads render concurrently, so a cached repeat image could reach the engine before its data.
+                mm_processor_cache_gb=0,
                 compilation_config={"mode": 0, "cudagraph_mode": "FULL_DECODE_ONLY"},
                 **speculative_kwargs,
             )
@@ -411,6 +413,8 @@ class NemotronParse35(BaseModel):
             [{"prompt": "<pad>" + task_prompt, "multi_modal_data": {"image": page}}],
             sampling,
             tokenization_kwargs={"add_special_tokens": False},
+            # The HF parser checks the finish reason and records it with the stage.
+            raise_on_failed_finish=False,
         )[0]
         output = request.outputs[0]
         return {
@@ -527,8 +531,15 @@ class _AsyncParseEngine:
         self._request_ids = itertools.count()
         self._render_lock = threading.Lock()
 
-    def generate(self, prompts: list[Any], params: Any, *, tokenization_kwargs: dict | None = None) -> list[Any]:
-        """Return each prompt's final ``RequestOutput`` in prompt order; any request failure raises."""
+    def generate(
+        self,
+        prompts: list[Any],
+        params: Any,
+        *,
+        tokenization_kwargs: dict | None = None,
+        raise_on_failed_finish: bool = True,
+    ) -> list[Any]:
+        """Return final request outputs in prompt order, raising on failed finish reasons by default."""
         import asyncio
         import os
 
@@ -554,6 +565,12 @@ class _AsyncParseEngine:
                     f"Parse engine returned no output for request {request_id}. "
                     "Check the vLLM engine logs for an error, then retry the batch."
                 )
+            reason = output.outputs[0].finish_reason
+            if raise_on_failed_finish and reason in ("abort", "error"):
+                raise RuntimeError(
+                    f"Parse engine request {request_id} finished with reason {reason!r}. "
+                    "Check the vLLM engine logs for an error, then retry the batch."
+                )
             return output
 
         async def gather() -> list[Any]:
@@ -575,9 +592,21 @@ class _AsyncParseEngine:
     def shutdown(self, timeout: float | None = None) -> None:
         """Stop the engine core, then the private event loop."""
         self.engine.shutdown(timeout=timeout)
-        self._stop_loop()
+        self._stop_loop(timeout=timeout)
 
-    def _stop_loop(self) -> None:
+    def _stop_loop(self, timeout: float | None = 30.0) -> None:
+        import asyncio
+
+        async def cancel_pending() -> None:
+            # vLLM's shutdown only schedules its output handler's cancellation; let it finish before closing.
+            tasks = [task for task in asyncio.all_tasks() if task is not asyncio.current_task()]
+            for task in tasks:
+                if not task.cancelling():
+                    task.cancel()
+            if tasks:
+                await asyncio.wait(tasks, timeout=timeout)
+
+        asyncio.run_coroutine_threadsafe(cancel_pending(), self._loop).result()
         self._loop.call_soon_threadsafe(self._loop.stop)
         self._thread.join()
         self._loop.close()
