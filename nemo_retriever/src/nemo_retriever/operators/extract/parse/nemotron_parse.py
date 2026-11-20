@@ -6,21 +6,27 @@
 Nemotron Parse pipeline stage for native multipart and legacy contracts.
 
 Runs the Nemotron Parse model on full page images to extract structured
-document content (text, tables, charts, infographics) in a single pass,
+document content (text, tables, charts, infographics) with optional Parse 3.5 crop refinement,
 replacing the page-elements → OCR multi-stage pipeline.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from contextvars import copy_context
+from dataclasses import asdict, dataclass
 from enum import Enum
+from importlib import import_module
+from itertools import cycle
+from threading import Lock
 from typing import Any, Dict, List, Literal, Optional, Tuple
 from urllib.parse import urlsplit
 
 import base64
 import io
 import json
+import logging
 import re
+import threading
 import time
 import traceback
 
@@ -35,7 +41,7 @@ from nemo_retriever.operators.abstract_operator import AbstractOperator
 from nemo_retriever.operators.cpu_operator import CPUOperator
 from nemo_retriever.operators.gpu_operator import GPUOperator
 from nemo_retriever.operators.operator_archetype import ArchetypeOperator
-from nemo_retriever.models.nim.chat_completions import invoke_chat_completions_images
+from nemo_retriever.models.nim.chat_completions import invoke_chat_completion_step, invoke_chat_completions_images
 from nemo_retriever.models.nim.nim import NIMClient, invoke_image_inference_batches
 from nemo_retriever.common.params import RemoteRetryParams
 from nemo_retriever.common.params.utils import (
@@ -45,7 +51,14 @@ from nemo_retriever.common.params.utils import (
     NEMOTRON_PARSE_LOCAL_MODELS,
     validate_nemotron_parse_endpoint_list,
     resolve_nemotron_parse_dflash_tokens,
+    validate_nemotron_parse_mode,
 )
+
+logger = logging.getLogger(__name__)
+
+# A tagged stream opens with the first element's bounding-box coordinates; stray
+# coordinate-like text inside Markdown does not start a tagged stream.
+_RE_TAGGED_STREAM_START = re.compile(r"<x_\d+(?:\.\d+)?><y_\d+(?:\.\d+)?>")
 
 try:
     from PIL import Image
@@ -92,6 +105,30 @@ def _error_payload(*, stage: str, exc: BaseException) -> Dict[str, Any]:
     }
 
 
+def _page_label(row: Any) -> str:
+    """Identify a page in log messages by its source path and page number."""
+    return f"path={getattr(row, 'path', None)!s} page={getattr(row, 'page_number', None)!s}"
+
+
+def _completion(finish_reason: Any = None, output_tokens: Any = None, *, failed: bool = False) -> Dict[str, Any]:
+    """Describe whether generation failed, hit its output token limit, or finished.
+
+    ``complete`` requires a reported stop reason other than ``length``. Backends that
+    report none (chat-completions and Transformers) are ``unknown`` rather than
+    assumed finished.
+    """
+    status = (
+        "failed"
+        if failed
+        else "unknown" if finish_reason is None else "incomplete" if finish_reason == "length" else "complete"
+    )
+    return {
+        "status": status,
+        "finish_reason": finish_reason,
+        "output_tokens": output_tokens,
+    }
+
+
 def _extract_parse_text(response_item: Any) -> str:
     """Extract text from a Nemotron Parse NIM response item."""
     if response_item is None:
@@ -129,6 +166,7 @@ def _route_parsed_elements(
     extract_charts: bool,
     extract_infographics: bool,
     parse35: bool = False,
+    parse35_document: dict[str, Any] | None = None,
     table_format: Optional[str] = None,
     ordered_regions: Optional[List[Dict[str, Any]]] = None,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]], Optional[str]]:
@@ -144,7 +182,9 @@ def _route_parsed_elements(
 
         elements = [
             (block["class"], block["bbox"], block["content"])
-            for block in _postprocess_parse35_blocks(raw_text, table_format=table_format or "HTML")
+            for block in _postprocess_parse35_blocks(
+                raw_text, table_format=table_format or "HTML", document=parse35_document
+            )
         ]
     else:
         classes, bboxes, texts = extract_classes_bboxes(raw_text)
@@ -320,6 +360,79 @@ def _decode_page_image(page_image_b64: str) -> np.ndarray:
 # ---------------------------------------------------------------------------
 
 
+def _validate_parse_mode(mode: str, model: str | None, invoke_url: str | None, task_prompt: str | None) -> None:
+    validate_nemotron_parse_mode(mode, model=model, invoke_url=invoke_url)
+    if mode != "single" and task_prompt is not None:
+        raise ValueError("Multi-pass Parse uses the HF stage prompts; custom task_prompt is not supported.")
+
+
+def _parse35_multipass(
+    images: list[Any],
+    *,
+    mode: str,
+    model: Any,
+    model_name: str,
+    invoke_url: str,
+    api_key: str | None,
+    timeout_s: float,
+    retry: RemoteRetryParams,
+    sampling: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Delegate stage selection, cropping, and merging to the pinned HF parser."""
+    from nemo_retriever.common.modality.parse.nemotron_parse35_postprocessing import _load_parse35_helpers
+
+    hf = import_module(f"{_load_parse35_helpers().__name__}.inference")
+    endpoints = cycle(validate_nemotron_parse_endpoint_list(invoke_url))
+    endpoint_lock = Lock()
+    caller_context = copy_context()
+
+    def backend(image: Any, *, prompt: str, stage: str, settings: Any) -> dict[str, Any]:
+        generation = asdict(settings)
+        try:
+            if not invoke_url:
+                return model.invoke_response(image, task_prompt=prompt, sampling_params=generation)
+            with endpoint_lock:
+                endpoint = next(endpoints)
+            stream = io.BytesIO()
+            image.save(stream, format="PNG")
+            encoded = base64.b64encode(stream.getvalue()).decode("ascii")
+            response = caller_context.copy().run(
+                invoke_chat_completion_step,
+                invoke_url=endpoint,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": prompt},
+                            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{encoded}"}},
+                        ],
+                    }
+                ],
+                model=model_name,
+                api_key=api_key,
+                timeout_s=timeout_s,
+                temperature=generation.pop("temperature"),
+                max_tokens=generation.pop("max_tokens"),
+                extra_body={**generation, "skip_special_tokens": False},
+                max_retries=retry.remote_max_retries,
+                max_429_retries=retry.remote_max_429_retries,
+            )
+            choice = response["choices"][0]
+            return {
+                "raw_out": choice["message"].get("content"),
+                "finish_reason": choice.get("finish_reason"),
+                "usage": response.get("usage", {}),
+            }
+        except Exception as exc:
+            raise hf.GenerationError(stage, {"error": str(exc)}) from exc
+
+    parser = hf.DocumentParser(model=model_name, backend=backend, fullpage=hf.GenerationSettings(**sampling))
+    if invoke_url:
+        pages = [Image.fromarray(image) for image in images]
+        return parser.parse_many(pages, mode=mode, concurrency=retry.remote_max_pool_workers)
+    return [parser.parse(Image.fromarray(image), mode=mode) for image in images]
+
+
 def nemotron_parse_pages(
     batch_df: Any,
     *,
@@ -334,6 +447,7 @@ def nemotron_parse_pages(
     nemotron_parse_model: Optional[str] = None,
     nemotron_parse_table_format: Optional[str] = None,
     parse_sampling_params: Optional[Dict[str, Any]] = None,
+    parse_mode: str = "single",
     task_prompt: Optional[str] = None,
     remote_retry: RemoteRetryParams | None = None,
     nim_client: NIMClient | None = None,
@@ -341,7 +455,8 @@ def nemotron_parse_pages(
 ) -> Any:
     """Run Nemotron Parse on full page images.
 
-    Each page is parsed in a single model call.  The structured output is
+    Single mode makes one call per page; double/triple delegate refinement to HF.
+    Multi-pass sampling overrides affect only the full-page stage. The structured output is
     split by element class (Text, Table, Chart, Picture, …) and routed to
     the corresponding pipeline content columns (``table``, ``chart``,
     ``infographic``).  Non-structured elements (headings, body text, …) are
@@ -352,10 +467,11 @@ def nemotron_parse_pages(
     ``simple_html``, ``markdown``, or ``latex`` for Parse 3.5 Table blocks only.
     ``parse_sampling_params`` contains validated Parse 3.5 generation overrides
     (temperature, repetition_penalty, top_k, top_p, seed, max_tokens). Remote
-    overrides require chat-completions URLs; local adapters must be configured
-    with those settings at construction, as the GPU actor does. Unset settings
-    retain the selected backend's defaults. Unsupported models or endpoints
-    raise ValueError before inference.
+    overrides require chat-completions URLs. In single mode, local adapters must
+    be configured with those settings at construction, as the GPU actor does.
+    Multi-pass supplies settings per call and uses HF defaults for unset fields.
+    Unset single-pass settings retain the selected backend's defaults.
+    Unsupported models or endpoints raise ValueError before inference.
     With no format selection, legacy models retain Markdown tables.
     ``task_prompt=None`` preserves the default prompt with picture text disabled.
     An explicit prompt takes precedence.
@@ -364,6 +480,15 @@ def nemotron_parse_pages(
 
     Native ``/v1/parse`` endpoints return tagged content in ``content``, which
     uses the same element routing. Untagged Markdown is preserved as page text.
+
+    Each parsed page records ``completion`` in its ``nemotron_parse_v1_2``
+    metadata: ``status`` is ``"complete"``, ``"incomplete"`` when generation
+    reached its output token limit (``finish_reason="length"``), ``"unknown"``
+    when the backend reports no stop reason, or ``"failed"``.
+    Incomplete pages keep their fully tagged elements, drop the unterminated
+    final element, and log ``Warning: Nemotron Parse page incomplete:`` with the
+    page's source path and page number. Failures log
+    ``Warning: Nemotron Parse batch failed:`` or ``Warning: Nemotron Parse page failed:``.
     """
     from nemo_retriever.common.params import ParseParams
 
@@ -395,6 +520,9 @@ def nemotron_parse_pages(
             for url in validate_nemotron_parse_endpoint_list(invoke_url)
         ):
             raise ValueError("Parse sampling overrides require local inference or /v1/chat/completions URLs.")
+    _validate_parse_mode(
+        parse_mode, NEMOTRON_PARSE35_MODEL if not use_remote and parse35 else selected_model, invoke_url, task_prompt
+    )
     if task_prompt is None:
         task_prompt = NEMOTRON_PARSE_DEFAULT_TASK_PROMPT
     if use_remote:
@@ -415,19 +543,23 @@ def nemotron_parse_pages(
     # -- Phase 1: collect page images that need inference ----------------
     batch_indices: List[int] = []  # index into batch_df
     batch_images: List[Any] = []  # numpy arrays (local) or b64 strings (remote)
+    rows = list(batch_df.itertuples(index=False))
 
-    for idx, row in enumerate(batch_df.itertuples(index=False)):
+    for idx, row in enumerate(rows):
         page_image = getattr(row, "page_image", None) or {}
         page_image_b64 = page_image.get("image_b64") if isinstance(page_image, dict) else None
         if not isinstance(page_image_b64, str) or not page_image_b64:
             continue
         try:
-            if use_remote:
+            if use_remote and parse_mode == "single":
                 batch_images.append(page_image_b64)
             else:
                 batch_images.append(_decode_page_image(page_image_b64))
             batch_indices.append(idx)
         except Exception as e:
+            logger.warning(
+                f"Warning: Nemotron Parse page failed: {_page_label(row)} {type(e).__name__}: {e}", exc_info=e
+            )
             all_meta[idx] = {
                 "timing": None,
                 "error": {
@@ -436,16 +568,40 @@ def nemotron_parse_pages(
                     "message": str(e),
                     "traceback": "".join(traceback.format_exception(type(e), e, e.__traceback__)),
                 },
+                "completion": _completion(failed=True),
             }
 
     # -- Phase 2: run model inference in a single batch ------------------
     raw_texts: List[str] = [""] * len(batch_indices)
+    # (finish_reason, output_tokens) per inferred page; None when unreported.
+    outcomes: List[Tuple[Any, Any]] = [(None, None)] * len(batch_indices)
     uses_tool_call_routing = False
     contract: _ResolvedNemotronParseContract | None = None
     native_parse = False
+    documents: list[dict[str, Any]] = []
     if batch_images:
         try:
-            if use_remote:
+            if parse_mode != "single":
+                from nemo_retriever.models.hf_model_registry import get_hf_revision
+
+                documents = _parse35_multipass(
+                    batch_images,
+                    mode=parse_mode,
+                    model=model,
+                    model_name=selected_model,
+                    invoke_url=invoke_url,
+                    api_key=api_key,
+                    timeout_s=request_timeout_s,
+                    retry=retry,
+                    sampling=sampling,
+                )
+                raw_texts = [document["raw_out"] for document in documents]
+                for idx, document in zip(batch_indices, documents):
+                    all_meta[idx]["multipass"] = {
+                        **document["inference"],
+                        "helper_revision": get_hf_revision(NEMOTRON_PARSE35_MODEL),
+                    }
+            elif use_remote:
                 endpoints = validate_nemotron_parse_endpoint_list(invoke_url)
                 native_endpoints = [urlsplit(url).path.rstrip("/") == "/v1/parse" for url in endpoints]
                 if any(native_endpoints) and not all(native_endpoints):
@@ -461,15 +617,24 @@ def nemotron_parse_pages(
                             timeout_s=float(request_timeout_s),
                             max_retries=int(retry.remote_max_retries),
                             max_429_retries=int(retry.remote_max_429_retries),
+                            allow_incomplete=True,
                         )
                     finally:
                         if nim_client is None:
                             client.shutdown()
                     raw_texts = [response["content"].strip() for response in responses]
+                    outcomes = []
                     for idx, response in zip(batch_indices, responses):
+                        usage = response.get("usage")
+                        outcomes.append(
+                            (
+                                response.get("finish_reason"),
+                                usage.get("output_tokens") if isinstance(usage, dict) else None,
+                            )
+                        )
                         all_meta[idx]["native_parse"] = {
                             "finish_reason": response.get("finish_reason"),
-                            "usage": response.get("usage"),
+                            "usage": usage,
                         }
                 elif "/v1/chat/completions" in invoke_url:
                     contract = _resolve_nemotron_parse_contract(invoke_url, nemotron_parse_model)
@@ -527,8 +692,13 @@ def nemotron_parse_pages(
                     raw_texts = [_extract_parse_text(item) for item in response_items]
             else:
                 # Local models use task_prompt and return tagged text.
+                invoke_batch_results = getattr(model, "invoke_batch_results", None)
                 invoke_batch = getattr(model, "invoke_batch", None)
-                if invoke_batch is not None:
+                if invoke_batch_results is not None:
+                    results = invoke_batch_results(batch_images, task_prompt=task_prompt)
+                    raw_texts = [str(result.text or "").strip() for result in results]
+                    outcomes = [(result.finish_reason, result.output_tokens) for result in results]
+                elif invoke_batch is not None:
                     raw_texts = [str(t or "").strip() for t in invoke_batch(batch_images, task_prompt=task_prompt)]
                 else:
                     raw_texts = [str(model.invoke(img, task_prompt=task_prompt) or "").strip() for img in batch_images]
@@ -549,15 +719,20 @@ def nemotron_parse_pages(
                 )
                 hint.__cause__ = e
                 e = hint
-            print(f"Warning: Nemotron Parse batch failed: {type(e).__name__}: {e}")
+            logger.warning(f"Warning: Nemotron Parse batch failed: {type(e).__name__}: {e}", exc_info=e)
             err = {
                 "stage": "nemotron_parse_pages",
                 "type": e.__class__.__name__,
                 "message": str(e),
                 "traceback": "".join(traceback.format_exception(type(e), e, e.__traceback__)),
             }
+            if parse_mode != "single":
+                err["parse_mode"] = parse_mode
+                err["inference_stage"] = getattr(e, "stage", None)
+                response = getattr(e, "response", None)
+                err["finish_reason"] = response.get("finish_reason") if isinstance(response, dict) else None
             for i in batch_indices:
-                all_meta[i] = {"timing": None, "error": err}
+                all_meta[i] = {"timing": None, "error": err, "completion": _completion(failed=True)}
             raw_texts = []
 
     # -- Phase 3: route parsed elements into content channels ------------
@@ -565,7 +740,18 @@ def nemotron_parse_pages(
     for pos, raw_text in enumerate(raw_texts):
         idx = batch_indices[pos]
         try:
+            completion = _completion(*outcomes[pos])
+            all_meta[idx]["completion"] = completion
+            if completion["status"] == "incomplete":
+                logger.warning(
+                    f"Warning: Nemotron Parse page incomplete: {_page_label(rows[idx])} "
+                    f"finish_reason={completion['finish_reason']} output_tokens={completion['output_tokens']}"
+                )
             if native_parse and not extract_classes_bboxes(raw_text)[0]:
+                if completion["status"] == "incomplete" and _RE_TAGGED_STREAM_START.match(raw_text):
+                    # Capped before the first tagged element finished: there is
+                    # nothing usable to route, and the raw tags are not page text.
+                    continue
                 # Only complete bounding-box/class sequences select the tagged
                 # router. Literal or incomplete tags remain page Markdown.
                 if not extract_text:
@@ -576,6 +762,7 @@ def nemotron_parse_pages(
             route_kwargs = (
                 {
                     "parse35": parse35,
+                    "parse35_document": documents[pos] if documents else None,
                     "table_format": nemotron_parse_table_format,
                     "ordered_regions": ordered_regions if parse35 else None,
                 }
@@ -599,6 +786,9 @@ def nemotron_parse_pages(
                     region for region in ordered_regions if extract_text or region["label_name"] != "text"
                 ]
         except BaseException as e:
+            logger.warning(
+                f"Warning: Nemotron Parse page failed: {_page_label(rows[idx])} {type(e).__name__}: {e}", exc_info=e
+            )
             all_meta[idx] = {
                 "timing": None,
                 "error": {
@@ -607,6 +797,7 @@ def nemotron_parse_pages(
                     "message": str(e),
                     "traceback": "".join(traceback.format_exception(type(e), e, e.__traceback__)),
                 },
+                "completion": _completion(*outcomes[pos], failed=True),
             }
 
     elapsed = time.perf_counter() - t0_total
@@ -649,6 +840,9 @@ def nemotron_parse_pages(
 class NemotronParseGPUActor(AbstractOperator, GPUOperator):
     """Ray-friendly callable that initialises the selected local Parse model once per actor."""
 
+    # Ray UDF threads per actor, so several batches share one vLLM engine and its scheduler.
+    UDF_THREADS: int = 16
+
     def __init__(
         self,
         *,
@@ -661,6 +855,7 @@ class NemotronParseGPUActor(AbstractOperator, GPUOperator):
         nemotron_parse_table_format: Optional[str] = None,
         parse_sampling_params: Optional[Dict[str, Any]] = None,
         nemotron_parse_dflash_tokens: int | Literal["auto"] | None = "auto",
+        parse_mode: str = "single",
         invoke_url: Optional[str] = None,
         api_key: Optional[str] = None,
         request_timeout_s: float = 120.0,
@@ -683,13 +878,17 @@ class NemotronParseGPUActor(AbstractOperator, GPUOperator):
         validate_nemotron_parse_endpoint_list(self._invoke_url)
         self._api_key = api_key
         self._request_timeout_s = float(request_timeout_s)
-        self._task_prompt = task_prompt if task_prompt is not None else NEMOTRON_PARSE_DEFAULT_TASK_PROMPT
+        self._parse_mode = parse_mode
+        selected_model = nemotron_parse_model or (NEMOTRON_PARSE_LOCAL_DEFAULT_MODEL if not self._invoke_url else None)
+        _validate_parse_mode(parse_mode, selected_model, self._invoke_url, task_prompt)
+        self._task_prompt = task_prompt
         self._remote_retry = RemoteRetryParams(
             remote_max_pool_workers=int(remote_max_pool_workers),
             remote_max_retries=int(remote_max_retries),
             remote_max_429_retries=int(remote_max_429_retries),
         )
         self._model = None
+        self._model_lock = threading.Lock()
         if self._invoke_url:
             self._nim_client = NIMClient(max_pool_workers=int(remote_max_pool_workers))
         else:
@@ -704,25 +903,41 @@ class NemotronParseGPUActor(AbstractOperator, GPUOperator):
 
     def _ensure_model(self) -> None:
         """Load the selected local model on the worker rather than the driver."""
-        if self._model is None and not self._invoke_url:
-            model_id = self._nemotron_parse_model or NEMOTRON_PARSE_LOCAL_DEFAULT_MODEL
-            if model_id not in NEMOTRON_PARSE_LOCAL_MODELS:
-                raise ValueError(
-                    f"Unsupported local Nemotron Parse model: {model_id}. "
-                    f"Use `{NEMOTRON_PARSE_LOCAL_DEFAULT_MODEL}` locally, or configure "
-                    "`nemotron_parse_invoke_url` or `invoke_url` to use a compatible remote model."
-                )
-            from nemo_retriever.models.local import NemotronParse35
+        if self._model is not None or self._invoke_url:
+            return
+        with self._model_lock:
+            if self._model is None:
+                self._load_model()
 
-            model_kwargs: Dict[str, Any] = {"task_prompt": self._task_prompt, "backend": "vllm"}
-            model_kwargs["dflash_tokens"] = self._nemotron_parse_dflash_tokens
-            if self._parse_sampling_params:
-                model_kwargs["sampling_params"] = {
-                    key: value for key, value in self._parse_sampling_params.items() if key != "max_tokens"
-                }
-                if "max_tokens" in self._parse_sampling_params:
-                    model_kwargs["max_tokens"] = self._parse_sampling_params["max_tokens"]
-            self._model = NemotronParse35(**model_kwargs)
+    def _load_model(self) -> None:
+        model_id = self._nemotron_parse_model or NEMOTRON_PARSE_LOCAL_DEFAULT_MODEL
+        if model_id not in NEMOTRON_PARSE_LOCAL_MODELS:
+            raise ValueError(
+                f"Unsupported local Nemotron Parse model: {model_id}. "
+                f"Use `{NEMOTRON_PARSE_LOCAL_DEFAULT_MODEL}` locally, or configure "
+                "`nemotron_parse_invoke_url` or `invoke_url` to use a compatible remote model."
+            )
+        from nemo_retriever.models.local import NemotronParse35
+
+        model_kwargs: Dict[str, Any] = {
+            "task_prompt": self._task_prompt if self._task_prompt is not None else NEMOTRON_PARSE_DEFAULT_TASK_PROMPT,
+            "backend": "vllm",
+        }
+        model_kwargs["dflash_tokens"] = self._nemotron_parse_dflash_tokens
+        if self._parse_sampling_params:
+            model_kwargs["sampling_params"] = {
+                key: value for key, value in self._parse_sampling_params.items() if key != "max_tokens"
+            }
+            if "max_tokens" in self._parse_sampling_params:
+                model_kwargs["max_tokens"] = self._parse_sampling_params["max_tokens"]
+        self._model = NemotronParse35(**model_kwargs)
+
+    def cleanup(self) -> None:
+        """Shut down the local engine and its event-loop thread; repeated calls are safe."""
+        with self._model_lock:
+            if self._model is not None:
+                self._model.unload()
+                self._model = None
 
     def process(self, data: Any, **kwargs: Any) -> Any:
         self._ensure_model()
@@ -733,6 +948,7 @@ class NemotronParseGPUActor(AbstractOperator, GPUOperator):
             nemotron_parse_model=self._nemotron_parse_model,
             nemotron_parse_table_format=self._nemotron_parse_table_format,
             parse_sampling_params=self._parse_sampling_params,
+            parse_mode=self._parse_mode,
             api_key=self._api_key,
             request_timeout_s=self._request_timeout_s,
             task_prompt=self._task_prompt,
@@ -752,6 +968,7 @@ class NemotronParseGPUActor(AbstractOperator, GPUOperator):
         try:
             return self.run(batch_df, **override_kwargs)
         except BaseException as e:
+            logger.warning(f"Warning: Nemotron Parse batch failed: {type(e).__name__}: {e}", exc_info=e)
             if isinstance(batch_df, pd.DataFrame):
                 out = batch_df.copy()
                 payload = _error_payload(stage="nemotron_parse_actor_call", exc=e)
@@ -789,6 +1006,7 @@ class NemotronParseCPUActor(AbstractOperator, CPUOperator):
         nemotron_parse_table_format: Optional[str] = None,
         parse_sampling_params: Optional[Dict[str, Any]] = None,
         nemotron_parse_dflash_tokens: int | Literal["auto"] | None = "auto",
+        parse_mode: str = "single",
         invoke_url: Optional[str] = None,
         api_key: Optional[str] = None,
         request_timeout_s: float = 120.0,
@@ -813,7 +1031,10 @@ class NemotronParseCPUActor(AbstractOperator, CPUOperator):
         validate_nemotron_parse_endpoint_list(self._invoke_url)
         self._api_key = api_key
         self._request_timeout_s = float(request_timeout_s)
-        self._task_prompt = task_prompt if task_prompt is not None else NEMOTRON_PARSE_DEFAULT_TASK_PROMPT
+        self._parse_mode = parse_mode
+        selected_model = nemotron_parse_model or (NEMOTRON_PARSE_LOCAL_DEFAULT_MODEL if not self._invoke_url else None)
+        _validate_parse_mode(parse_mode, selected_model, self._invoke_url, task_prompt)
+        self._task_prompt = task_prompt
         self._remote_retry = RemoteRetryParams(
             remote_max_pool_workers=int(remote_max_pool_workers),
             remote_max_retries=int(remote_max_retries),
@@ -837,6 +1058,7 @@ class NemotronParseCPUActor(AbstractOperator, CPUOperator):
             nemotron_parse_model=self._nemotron_parse_model,
             nemotron_parse_table_format=self._nemotron_parse_table_format,
             parse_sampling_params=self._parse_sampling_params,
+            parse_mode=self._parse_mode,
             api_key=self._api_key,
             request_timeout_s=self._request_timeout_s,
             task_prompt=self._task_prompt,
@@ -856,6 +1078,7 @@ class NemotronParseCPUActor(AbstractOperator, CPUOperator):
         try:
             return self.run(batch_df, **override_kwargs)
         except BaseException as e:
+            logger.warning(f"Warning: Nemotron Parse batch failed: {type(e).__name__}: {e}", exc_info=e)
             if isinstance(batch_df, pd.DataFrame):
                 out = batch_df.copy()
                 payload = _error_payload(stage="nemotron_parse_actor_call", exc=e)
@@ -896,6 +1119,7 @@ class NemotronParseActor(ArchetypeOperator):
         nemotron_parse_table_format: Optional[str] = None,
         parse_sampling_params: Optional[Dict[str, Any]] = None,
         nemotron_parse_dflash_tokens: int | Literal["auto"] | None = "auto",
+        parse_mode: str = "single",
         invoke_url: Optional[str] = None,
         api_key: Optional[str] = None,
         request_timeout_s: float = 120.0,
@@ -919,6 +1143,7 @@ class NemotronParseActor(ArchetypeOperator):
             nemotron_parse_model=nemotron_parse_model,
             nemotron_parse_table_format=nemotron_parse_table_format,
             parse_sampling_params=parse_sampling_params,
+            parse_mode=parse_mode,
             invoke_url=invoke_url,
             api_key=api_key,
             request_timeout_s=request_timeout_s,
